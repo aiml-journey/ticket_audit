@@ -1,796 +1,2046 @@
-"""
-audit_tickets.py
-Robust two-way reconciliation script using openpyxl and pypdf to audit daily tickets
-against the Excel MIS report.
-
-Handles:
-- Train tickets (IRCTC Direct / Normal User ERS, TravelBoutiqueOnline / TBO, Riya Connect)
-- Bus tickets (SeatSeller / RedBus / AbhiBus / KSRTC)
-- Flight tickets (IndiGo / Cleartrip)
-- Open file locks: saves to 'MIS_Report_Audited.xlsx' or fallback 'MIS_Report_Audited_Updated.xlsx'
-- Highlights:
-  * Matched: Light Green (#C6EFCE)
-  * Station mismatch: Red (#FFC7CE)
-  * Name / Train format drift: Yellow (#FFF2CC)
-  * Fare difference: Yellow (#FFF2CC)
-  * Missing PDF: Red (#FFC7CE)
-  * Unrecorded ticket: Light Blue (#D9E1F2)
-"""
 
 import os
-import sys
-import glob
 import re
 from pathlib import Path
-import openpyxl
+from datetime import datetime
+
+from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment
-from openpyxl.utils import get_column_letter
-import pypdf
 
-# Ensure standard UTF-8 console output for Windows terminal
-if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
-
-# Cell Highlight Fills
-FILL_RED = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-FILL_YELLOW = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
-FILL_GREEN = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-FILL_LIGHT_BLUE = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-
-MONTH_MAP = {
-    "jan": "01", "feb": "02", "mar": "03", "apr": "04", "may": "05", "jun": "06",
-    "jul": "07", "aug": "08", "sep": "09", "sept": "09", "oct": "10", "nov": "11", "dec": "12"
-}
-
-CITY_ALIASES = {
-    "BANGALORE": ["BENGALURU", "SBC", "YPR"],
-    "BENGALURU": ["BANGALORE", "SBC", "YPR"],
-    "MADRAS": ["CHENNAI", "MAS"],
-    "CHENNAI": ["MADRAS", "MAS"],
-    "MUMBAI": ["BOM", "MMCT", "BCT", "CSMT", "BDTS", "BORIVALI", "DADAR", "DDR", "BVI"],
-    "CALCUTTA": ["KOLKATA", "HWH", "HOWRAH", "SANTRAGACHI", "SRC"],
-    "HOWRAH": ["KOLKATA", "HWH", "CALCUTTA", "SANTRAGACHI"],
-    "NASIK": ["NASHIK", "NK"],
-    "NASHIK": ["NASIK", "NK"],
-    "BARODA": ["VADODARA", "BRC"],
-    "VADODARA": ["BARODA", "BRC"],
-    "ALAPPUZHA": ["ALAPUZHA", "ALLP"],
-    "ALAPUZHA": ["ALAPPUZHA", "ALLP"],
-    "DR": ["DDR", "DADAR"],
-    "DDR": ["DR", "DADAR"],
-}
+from pypdf import PdfReader
 
 
-def format_date(d_str: str) -> str:
-    """Standardize extracted date string to DD-MM-YYYY format."""
-    if not d_str:
+# ============================================================
+# COLORS
+# ============================================================
+
+FILL_GREEN = PatternFill(
+    fill_type="solid",
+    fgColor="C6EFCE"
+)
+
+FILL_YELLOW = PatternFill(
+    fill_type="solid",
+    fgColor="FFEB9C"
+)
+
+FILL_RED = PatternFill(
+    fill_type="solid",
+    fgColor="FFC7CE"
+)
+
+FILL_ORANGE = PatternFill(
+    fill_type="solid",
+    fgColor="FCE4D6"
+)
+
+
+# ============================================================
+# BASIC NORMALIZATION
+# ============================================================
+
+def normalize_value(value):
+    """
+    Convert a value into a standard format for comparison.
+    """
+
+    if value is None:
         return ""
-    m = re.search(r"(\d{1,2})[-/\s]([A-Za-z]+)[-/\s](\d{4})", d_str)
-    if m:
-        day = int(m.group(1))
-        mon_raw = m.group(2).lower()
-        mon = MONTH_MAP.get(mon_raw[:4], MONTH_MAP.get(mon_raw[:3], mon_raw))
-        year = m.group(3)
-        return f"{day:02d}-{mon}-{year}"
-    return d_str
+
+    value = str(value).strip().upper()
+
+    # Replace multiple spaces
+    value = re.sub(r"\s+", " ", value)
+
+    return value
 
 
-def parse_station_str(stn_val: str) -> dict:
-    """Parse station string into code and normalized name."""
-    if not stn_val:
-        return {"raw": "", "code": None, "name": "", "norm": ""}
-    s = str(stn_val).strip()
-    m = re.search(r"\(([A-Z0-9]+)\)", s)
-    code = m.group(1).upper() if m else None
-    name = re.sub(r"\([A-Z0-9]+\)", "", s).strip()
-    norm = re.sub(r"[^A-Z0-9]", "", name.upper())
-    return {"raw": s, "code": code, "name": name, "norm": norm}
+def normalize_name(value):
+    """
+    Normalize passenger names.
+    """
+
+    if not value:
+        return ""
+
+    value = normalize_value(value)
+
+    # Remove punctuation
+    value = re.sub(r"[^A-Z0-9 ]", "", value)
+
+    # Remove extra spaces
+    value = re.sub(r"\s+", " ", value)
+
+    return value.strip()
 
 
-def compare_stations(excel_stn, pdf_stn, stn_label="Station"):
-    """Compare station from Excel with station from PDF with alias and city resolution."""
-    e = parse_station_str(excel_stn)
-    p = parse_station_str(pdf_stn)
+# ============================================================
+# DATE FUNCTIONS
+# ============================================================
 
-    # Station codes match
-    if e["code"] and p["code"]:
-        if e["code"] == p["code"]:
-            return True, None
-        e_alias = CITY_ALIASES.get(e["code"], [])
-        if p["code"] in e_alias:
-            return True, None
-        if e["norm"] and p["norm"] and (e["norm"] == p["norm"] or e["norm"] in p["norm"] or p["norm"] in e["norm"]):
-            return True, None
-        return (
-            False,
-            f"{stn_label} mismatch: PDF has '{p['code']}' ({p['raw']}) vs Excel '{e['code']}' ({e['raw']})",
-        )
+def format_date(value):
+    """
+    Convert common date formats into DD-MM-YYYY.
+    """
 
-    # Check normalized names
-    if e["norm"] == p["norm"]:
+    if value is None:
+        return ""
+
+    if hasattr(value, "strftime"):
+        return value.strftime("%d-%m-%Y")
+
+    value = str(value).strip()
+
+    formats = [
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%d-%m-%y",
+        "%d/%m/%y",
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d %b %Y",
+        "%d %B %Y",
+        "%d-%b-%Y",
+        "%d-%B-%Y",
+    ]
+
+    for fmt in formats:
+
+        try:
+            dt = datetime.strptime(value, fmt)
+            return dt.strftime("%d-%m-%Y")
+
+        except ValueError:
+            pass
+
+    return value
+
+
+def compare_date(excel_date, pdf_date):
+    """
+    Compare Excel and PDF travel dates.
+    """
+
+    if not excel_date and not pdf_date:
         return True, None
 
-    if e["norm"] and p["norm"]:
-        if e["norm"] in p["norm"] or p["norm"] in e["norm"]:
-            return True, None
-        # Check city aliases
-        for k, v in CITY_ALIASES.items():
-            if (k in e["norm"] or any(a in e["norm"] for a in v)) and (k in p["norm"] or any(a in p["norm"] for a in v)):
-                return True, None
+    if not excel_date:
+        return True, None
+
+    if not pdf_date:
+        return False, "Date of travel could not be extracted from PDF"
+
+    excel_date = format_date(excel_date)
+    pdf_date = format_date(pdf_date)
+
+    if excel_date == pdf_date:
+        return True, None
 
     return (
         False,
-        f"{stn_label} mismatch: PDF has '{p['raw']}' vs Excel '{e['raw']}'",
+        f"Date mismatch: Excel '{excel_date}' vs PDF '{pdf_date}'"
     )
 
 
-def clean_name(name_str: str) -> str:
-    """Remove prefixes, salutations, and extra spaces."""
-    if not name_str:
-        return ""
-    n = re.sub(r"^(?:mr|mrs|ms|dr|shri|smt)\.?\s+", "", str(name_str).strip(), flags=re.IGNORECASE)
-    return re.sub(r"\s+", " ", n).strip()
+# ============================================================
+# TEXT COMPARISON
+# ============================================================
 
+def compare_text(excel_value, pdf_value, field_name):
+    """
+    Compare two text values.
+    """
 
-def compare_passengers(excel_pax, pdf_paxes):
-    """Compare passenger name from Excel with PDF passenger list."""
-    ep_clean = clean_name(excel_pax)
-    if not ep_clean:
+    excel_value = normalize_value(excel_value)
+    pdf_value = normalize_value(pdf_value)
+
+    if not excel_value and not pdf_value:
         return True, None
 
-    # Check exact match
-    for pp in pdf_paxes:
-        pp_clean = clean_name(pp)
-        if ep_clean.upper() == pp_clean.upper():
-            return True, None
-
-    # Check prefix / drift / truncation / extra surname
-    for pp in pdf_paxes:
-        pp_clean = clean_name(pp)
-        if ep_clean.upper().startswith(pp_clean.upper()) or pp_clean.upper().startswith(ep_clean.upper()):
-            return (
-                False,
-                f"Passenger name format drift: Excel '{excel_pax}' vs PDF '{pp}'",
-            )
-        e_words = set(ep_clean.upper().split())
-        p_words = set(pp_clean.upper().split())
-        if p_words.issubset(e_words) or e_words.issubset(p_words):
-            return (
-                False,
-                f"Passenger name format drift (extra surname/name in Excel: '{excel_pax}' vs PDF: '{pp}')",
-            )
-
-    pdf_names_str = ", ".join(f"'{p}'" for p in pdf_paxes) if pdf_paxes else "None"
-    return False, f"Passenger name mismatch: Excel '{excel_pax}' vs PDF {pdf_names_str}"
-
-
-def compare_train(excel_train, pdf_train, pdf_class):
-    """Compare train name and detect class tag inclusion or formatting drift."""
-    e = str(excel_train or "").strip().upper()
-    p = str(pdf_train or "").strip().upper()
-    c = str(pdf_class or "").strip().upper()
-
-    if not e and not p:
-        return True, None
-    if e == p:
+    if not excel_value:
         return True, None
 
-    class_tags = [
-        "SECOND SITTING", "CHAIR CAR", "EXECUTIVE CLASS", "AC 3 TIER", "AC 2 TIER",
-        "AC FIRST CLASS", "SECOND AC", "THIRD AC", "SLEEPER", "2S", "CC", "3A", "2A", "1A", "SL", "EC", "3E"
-    ]
-    found_tags = [
-        tag for tag in class_tags
-        if re.search(rf"\b{re.escape(tag)}\b", e) and not re.search(rf"\b{re.escape(tag)}\b", p)
-    ]
-    if found_tags or (c and any(re.search(rf"\b{re.escape(part)}\b", e) for part in c.split() if len(part) > 2 and not re.search(rf"\b{re.escape(part)}\b", p))):
-        tag_str = ", ".join(found_tags) if found_tags else c
+    if not pdf_value:
         return (
             False,
-            f"Train name format drift: Train name includes class tag ('{tag_str}')",
+            f"{field_name} could not be extracted from PDF"
         )
 
-    if e in p or p in e:
+    if excel_value == pdf_value:
         return True, None
 
-    return False, f"Train name mismatch: Excel '{excel_train}' vs PDF '{pdf_train}'"
-
-
-def extract_pdf_data(pdf_path: str) -> dict:
-    """Extract PNR, stations, passenger name, train info, fare, and metadata from ticket PDF."""
-    reader = pypdf.PdfReader(pdf_path)
-    full_text = ""
-    for page in reader.pages:
-        full_text += (page.extract_text() or "") + "\n"
-
-    # Normalize whitespace and unicode characters
-    text = (
-        full_text.replace("\xa0", " ")
-        .replace("\u2010", "-")
-        .replace("\u2013", "-")
-        .replace("\u2014", "-")
+    return (
+        False,
+        f"{field_name} mismatch: "
+        f"Excel '{excel_value}' vs PDF '{pdf_value}'"
     )
-    base = os.path.basename(pdf_path)
 
-    # 1. PNR extraction
-    m_pnr = re.match(r"^([A-Z0-9]+)", base)
-    pnr = m_pnr.group(1) if m_pnr else ""
 
-    data = {
-        "file_name": base,
-        "file_path": pdf_path,
-        "pnr": pnr,
-        "from_station": "",
-        "to_station": "",
-        "from_code": None,
-        "to_code": None,
-        "passenger_names": [],
-        "passenger_name": "",
-        "train_no": "",
-        "train_name": "",
-        "train_class": "",
-        "class_code": "",
-        "quota": "",
-        "date_of_travel": "",
-        "total_fare": None,
-        "vendor": "IRCTC",
-        "mode": "Train",
+# ============================================================
+# PASSENGER NAME COMPARISON
+# ============================================================
+
+def compare_passenger(excel_name, pdf_names):
+    """
+    Compare MIS passenger name with names extracted from PDF.
+    """
+
+    excel_name = normalize_name(excel_name)
+
+    if not excel_name:
+        return True, None
+
+    if not pdf_names:
+        return (
+            False,
+            "Passenger name could not be extracted from PDF"
+        )
+
+    normalized_pdf_names = [
+        normalize_name(name)
+        for name in pdf_names
+        if name
+    ]
+
+    if not normalized_pdf_names:
+        return (
+            False,
+            "Passenger name could not be extracted from PDF"
+        )
+
+    # Exact match
+    if excel_name in normalized_pdf_names:
+        return True, None
+
+    # Compare without spaces
+    excel_compact = excel_name.replace(" ", "")
+
+    for name in normalized_pdf_names:
+
+        name_compact = name.replace(" ", "")
+
+        if excel_compact == name_compact:
+            return True, None
+
+    # Check partial names
+    for name in normalized_pdf_names:
+
+        if (
+            excel_name in name
+            or name in excel_name
+        ):
+            return True, None
+
+    return (
+        False,
+        f"Passenger mismatch: "
+        f"Excel '{excel_name}' vs PDF '{', '.join(pdf_names)}'"
+    )
+
+
+# ============================================================
+# CLASS NORMALIZATION
+# ============================================================
+
+def normalize_class(value):
+    """
+    Normalize railway/travel class values.
+    """
+
+    if not value:
+        return ""
+
+    value = normalize_value(value)
+
+    aliases = {
+
+        "AC 3 TIER": "3A",
+        "THIRD AC": "3A",
+        "THIRD AC TIER": "3A",
+        "3A": "3A",
+
+        "AC 2 TIER": "2A",
+        "SECOND AC": "2A",
+        "SECOND AC TIER": "2A",
+        "2A": "2A",
+
+        "AC FIRST CLASS": "1A",
+        "FIRST AC": "1A",
+        "FIRST CLASS": "1A",
+        "1A": "1A",
+
+        "SLEEPER": "SL",
+        "SLEEPER CLASS": "SL",
+        "SL": "SL",
+
+        "SECOND SITTING": "2S",
+        "SECOND SEATING": "2S",
+        "2S": "2S",
+
+        "CHAIR CAR": "CC",
+        "AC CHAIR CAR": "CC",
+        "CC": "CC",
+
+        "EXECUTIVE CLASS": "EC",
+        "EXECUTIVE CHAIR CAR": "EC",
+        "EC": "EC",
+
+        "AC 3 ECONOMY": "3E",
+        "3E": "3E",
+
+        "VISTADOME": "EV",
+        "EV": "EV",
+
+        "ANUBHUTI": "EA",
+        "EA": "EA",
     }
 
-    # 2. Bus Ticket Detection (SeatSeller / AbhiBus / KSRTC)
-    if "TICKET NUMBER:" in text or "SeatSeller" in text or "Booking Confirmed" in text or "Operator" in text:
-        data["mode"] = "Bus"
-        # Passenger Name
-        m_pax = re.search(r"Passenger\s+Name\s*\n\s*([^\n\r]+)", text, re.I)
-        if m_pax:
-            pax = m_pax.group(1).strip()
-            data["passenger_names"] = [pax]
-            data["passenger_name"] = pax
-        elif "SAMITH T" in base.upper():
-            data["passenger_names"] = ["Samith T"]
-            data["passenger_name"] = "Samith T"
+    return aliases.get(value, value)
 
-        # Operator
-        m_op = re.search(r"Operator\s*\n\s*([^\n\r]+)", text, re.I)
-        if m_op:
-            data["train_name"] = m_op.group(1).strip()
-        elif "KSRTC" in text:
-            data["train_name"] = "Karnataka State Road Transport Corporation(KSRTC)"
 
-        # Route
-        m_rt = re.search(r"\n([A-Za-z\s\(\)]+?)\s*\n\s*[A-Za-z\s]+\s*\n\s*\d{1,2}:\d{2}\s+[AP]M[^\n\r]*[➝→]\s*\n\s*([A-Za-z\s\(\)]+?)\s*\n", text)
-        if m_rt:
-            data["from_station"] = m_rt.group(1).strip()
-            data["to_station"] = m_rt.group(2).strip()
-        else:
-            m_fn_rt = re.search(r"-\s*([A-Za-z\s\(\)]+?)\s*(?:[➝→]|TO)\s*([A-Za-z\s\(\)]+?)(?:\s+on|\s+-|\.pdf)", base, re.I)
-            if m_fn_rt:
-                data["from_station"] = m_fn_rt.group(1).strip()
-                data["to_station"] = m_fn_rt.group(2).strip()
+def compare_class(excel_class, pdf_class, pdf_class_code):
+    """
+    Compare MIS class against PDF class.
+    """
 
-        # Fare
-        m_fare = re.search(r"(?:Total\s+Fare|Paid\s+Amount)[^\d\n\r₹Rs]*[\n\r\s]*[₹Rs\.]*\s*([0-9,]+\.[0-9]{2})", text, re.I)
-        if m_fare:
-            data["total_fare"] = float(m_fare.group(1).replace(",", ""))
+    excel_class = normalize_class(excel_class)
 
-        # Date of Travel
-        m_dot = re.search(r"(\d{1,2}[‐\-\s][A-Za-z]+[‐\-\s]\d{4})", text)
-        if m_dot:
-            data["date_of_travel"] = format_date(m_dot.group(1))
+    pdf_class = normalize_class(pdf_class)
+    pdf_class_code = normalize_class(pdf_class_code)
 
-        # Bus Class
-        m_bt = re.search(r"Bus\s+Type\s*\n\s*([^\n\r]+)", text, re.I)
-        if m_bt:
-            data["class_code"] = m_bt.group(1).strip()
+    pdf_final = pdf_class or pdf_class_code
 
-        return data
+    if not excel_class and not pdf_final:
+        return True, None
 
-    # 3. Flight Ticket Detection (IndiGo / Cleartrip)
-    if "Flight Round-Trip" in text or "IndiGo" in text:
-        data["mode"] = "Flight"
-        data["train_name"] = "INDIGO"
-        m_pax = re.search(r"Traveller\s+Name[^\n\r]*\n\s*([A-Za-z\s]+?)\s+(?:ADT|CHD|INF)\b", text, re.I)
-        if m_pax:
-            pax = m_pax.group(1).strip()
-            data["passenger_names"] = [pax]
-            data["passenger_name"] = pax
-        else:
-            data["passenger_names"] = ["Nishantsingh Rathod"]
-            data["passenger_name"] = "Nishantsingh Rathod"
+    if not excel_class:
+        return True, None
 
-        data["from_station"] = "Chhatrapati Shivaji Maharaj International Airport, Mumbai, India(BOM)"
-        data["to_station"] = "Birsa Munda Airport, Ranchi, India(IXR)"
-        data["from_code"] = "BOM"
-        data["to_code"] = "IXR"
-
-        m_fare = re.search(r"Total\s+Fare[\s\S]+?INR\s*([0-9,]+(?:\.[0-9]+)?)", text, re.I)
-        if m_fare:
-            data["total_fare"] = float(m_fare.group(1).replace(",", ""))
-        return data
-
-    # 4. Train Ticket Detection (IRCTC Direct / Normal User ERS, TBO, Riya Connect)
-    if not re.match(r"^\d{10}$", data["pnr"]):
-        pnr_m = re.search(r"PNR\s+Train\s+No[^\n\r]*\n\s*(\d{10})", text, re.I)
-        if not pnr_m:
-            pnr_m = re.search(r"Invoice\s*Number:\s*PS26(\d{10})", text, re.I)
-        if not pnr_m:
-            pnr_m = re.search(r"\bPNR[:\s]+(\d{10})\b", text, re.I)
-        if pnr_m:
-            data["pnr"] = pnr_m.group(1).strip()
-
-    # Passenger Details (handles normal spacing and no-space before age)
-    pax_matches = re.findall(
-        r"^\s*\d+\.?\s*([A-Za-z\s\.\'-]+?)\s*(\d{1,3})\s+(?:MALE|FEMALE|Male|Female|Transgender|M|F)\b",
-        text,
-        re.MULTILINE | re.I,
-    )
-    if pax_matches:
-        data["passenger_names"] = [re.sub(r"\s+", " ", p[0]).strip() for p in pax_matches]
-        data["passenger_name"] = data["passenger_names"][0]
-
-    # Train Number, Train Name, Class
-    m_tr = re.search(r"(\d{10})\s+(\d+)\s*/\s*([^\n\r]+)", text, re.I)
-    if not m_tr:
-        m_tr = re.search(r"Train\s+No[\./\s]*Name\s*\n\s*(\d+)\s*/\s*([^\n\r]+)", text, re.I)
-
-    if m_tr:
-        data["train_no"] = m_tr.group(1 if len(m_tr.groups()) == 2 else 2).strip()
-        train_desc = m_tr.group(2 if len(m_tr.groups()) == 2 else 3).strip()
-
-        code_m = re.search(r"\(([A-Z0-9]{1,4})\)\s*$", train_desc)
-        if code_m:
-            data["class_code"] = code_m.group(1)
-
-        known_classes = [
-            r"CHAIR\s+CAR\s*\(CC\)", r"SECOND\s+SITTING\s*\(2S\)", r"EXECUTIVE\s+(?:CHAIR\s+CAR|CLASS)\s*\(EC\)",
-            r"AC\s+3\s+TIER\s*\(3A\)", r"AC\s+2\s+TIER\s*\(2A\)", r"AC\s+FIRST\s+CLASS\s*\(1A\)",
-            r"SECOND\s+AC\s*\(2A\)", r"THIRD\s+AC\s*\(3A\)", r"AC\s+CHAIR\s+CAR\s*\(CC\)",
-            r"SLEEPER\s*(?:CLASS)?\s*\(SL\)", r"AC\s+3\s+ECONOMY\s*\(3E\)", r"VISTADOME\s*\(EV\)", r"ANUBHUTI\s*\(EA\)",
-        ]
-        class_regex = re.compile(r"\s+(" + "|".join(known_classes) + r")$", re.IGNORECASE)
-        cm = class_regex.search(train_desc)
-        if cm:
-            data["train_name"] = train_desc[: cm.start()].strip()
-            data["train_class"] = cm.group(1).strip()
-        else:
-            cm2 = re.search(r"\s+([A-Za-z0-9\s]+?\([A-Z0-9]{1,4}\))$", train_desc)
-            if cm2:
-                data["train_name"] = train_desc[: cm2.start()].strip()
-                data["train_class"] = cm2.group(1).strip()
-            else:
-                data["train_name"] = train_desc
-
-    # Stations
-    m_stn = re.search(
-        r"(?:Booked\s+From|Boarding\s+From)[\s\S]+?(?:Start Date|Departure\*|PNR)",
-        text,
-        re.I,
-    )
-    if m_stn:
-        clean_block = re.sub(
-            r"^(?:Booked|Boarding)\s+From\s*\n\s*To\s*\n", "", m_stn.group(0).strip(), flags=re.I
+    if not pdf_final:
+        return (
+            False,
+            "Class could not be extracted from PDF"
         )
-        stn_matches = re.findall(r"([A-Za-z0-9\s\.\'/-]+?\([A-Z0-9]{1,5}\))", clean_block)
-        stns = [s.strip() for s in stn_matches]
-        if len(stns) >= 3:
-            data["from_station"] = stns[1]
-            data["to_station"] = stns[-1]
-        elif len(stns) == 2:
-            data["from_station"] = stns[0]
-            data["to_station"] = stns[1]
-        elif len(stns) == 1:
-            data["from_station"] = stns[0]
 
-    if not data["from_station"]:
-        m_from = re.search(r"Booked\s+From\s*\n\s*([^\n\r]+)", text, re.I)
-        m_to = re.search(r"\nTo\s*\n\s*([^\n\r]+)", text, re.I)
-        if m_from and m_to:
-            data["from_station"] = m_from.group(1).strip()
-            data["to_station"] = m_to.group(2).strip()
+    if excel_class == pdf_final:
+        return True, None
 
-    if data["from_station"]:
-        c1 = re.search(r"\(([A-Z0-9]+)\)", data["from_station"])
-        data["from_code"] = c1.group(1).upper() if c1 else None
-    if data["to_station"]:
-        c2 = re.search(r"\(([A-Z0-9]+)\)", data["to_station"])
-        data["to_code"] = c2.group(1).upper() if c2 else None
+    return (
+        False,
+        f"Class mismatch: "
+        f"Excel '{excel_class}' vs PDF '{pdf_final}'"
+    )
 
-    # Total Fare
-    m_tf_riya = re.search(r"Total\s+Fare\s*:\s*₹?\s*([0-9,]+\.[0-9]{2})", text, re.I)
-    if m_tf_riya:
-        data["total_fare"] = float(m_tf_riya.group(1).replace(",", ""))
-    else:
-        pay_block = re.search(
-            r"Payment\s+Details\s*\n([\s\S]+?)(?:PG\s+Charges|Principal\s+Agent|Invoice\s+Number)",
+
+# ============================================================
+# QUOTA
+# ============================================================
+
+def normalize_quota(value):
+    """
+    Normalize railway quota values.
+    """
+
+    if not value:
+        return ""
+
+    value = normalize_value(value)
+
+    aliases = {
+
+        "GENERAL": "GENERAL",
+        "GN": "GENERAL",
+
+        "LADIES": "LADIES",
+        "LD": "LADIES",
+
+        "TATKAL": "TATKAL",
+        "CK": "TATKAL",
+
+        "PREMIUM TATKAL": "PREMIUM TATKAL",
+        "PT": "PREMIUM TATKAL",
+
+        "SENIOR CITIZEN": "SENIOR CITIZEN",
+        "SS": "SENIOR CITIZEN",
+
+        "LOWER BERTH": "LOWER BERTH",
+        "LB": "LOWER BERTH",
+    }
+
+    return aliases.get(value, value)
+
+
+def compare_quota(excel_quota, pdf_quota):
+    """
+    Compare MIS quota against PDF quota.
+    """
+
+    excel_quota = normalize_quota(excel_quota)
+    pdf_quota = normalize_quota(pdf_quota)
+
+    if not excel_quota and not pdf_quota:
+        return True, None
+
+    if not excel_quota:
+        return True, None
+
+    if not pdf_quota:
+        return (
+            False,
+            "Quota could not be extracted from PDF"
+        )
+
+    if excel_quota == pdf_quota:
+        return True, None
+
+    return (
+        False,
+        f"Quota mismatch: "
+        f"Excel '{excel_quota}' vs PDF '{pdf_quota}'"
+    )
+
+
+# ============================================================
+# FARE
+# ============================================================
+
+def clean_amount(value):
+    """
+    Convert currency values to float.
+    """
+
+    if value is None:
+        return None
+
+    try:
+
+        value = str(value)
+
+        value = (
+            value
+            .replace(",", "")
+            .replace("₹", "")
+            .replace("Rs.", "")
+            .replace("Rs", "")
+            .strip()
+        )
+
+        return float(value)
+
+    except (ValueError, TypeError):
+
+        return None
+
+
+def compare_fare(excel_fare, pdf_fare, passenger_count):
+    """
+    Compare Excel fare with PDF fare.
+
+    Allows:
+    - Full ticket amount
+    - Per-passenger amount
+    """
+
+    excel_amount = clean_amount(excel_fare)
+    pdf_amount = clean_amount(pdf_fare)
+
+    if excel_amount is None:
+        return True, None
+
+    if pdf_amount is None:
+        return (
+            False,
+            "Fare could not be extracted from PDF"
+        )
+
+    passenger_count = max(
+        1,
+        passenger_count
+    )
+
+    tolerance = 0.05
+
+    # Direct comparison
+    if abs(excel_amount - pdf_amount) <= tolerance:
+        return True, None
+
+    # Excel = per passenger
+    if abs(
+        excel_amount * passenger_count
+        - pdf_amount
+    ) <= tolerance:
+        return True, None
+
+    # PDF = per passenger
+    if abs(
+        excel_amount
+        - pdf_amount * passenger_count
+    ) <= tolerance:
+        return True, None
+
+    return (
+        False,
+        f"Fare mismatch: "
+        f"Excel ₹{excel_amount:.2f} "
+        f"vs PDF ₹{pdf_amount:.2f}"
+    )
+
+
+# ============================================================
+# TRAIN / FLIGHT / BUS NAME
+# ============================================================
+
+def compare_train(excel_train, pdf_train, pdf_class=""):
+    """
+    Compare train/flight/bus name.
+
+    Allows minor formatting differences.
+    """
+
+    excel_train = normalize_value(excel_train)
+    pdf_train = normalize_value(pdf_train)
+
+    if not excel_train:
+        return True, None
+
+    if not pdf_train:
+        return (
+            False,
+            "Train/Flight/Bus name could not be extracted from PDF"
+        )
+
+    if excel_train == pdf_train:
+        return True, None
+
+    excel_compact = excel_train.replace(" ", "")
+    pdf_compact = pdf_train.replace(" ", "")
+
+    if excel_compact == pdf_compact:
+        return True, None
+
+    if (
+        excel_train in pdf_train
+        or pdf_train in excel_train
+    ):
+        return True, None
+
+    return (
+        False,
+        f"Train/Flight/Bus name mismatch: "
+        f"Excel '{excel_train}' vs PDF '{pdf_train}'"
+    )
+
+
+# ============================================================
+# PDF TEXT EXTRACTION
+# ============================================================
+
+def extract_pdf_text(pdf_path):
+    """
+    Extract all text from a PDF.
+    """
+
+    text_parts = []
+
+    try:
+
+        reader = PdfReader(pdf_path)
+
+        for page in reader.pages:
+
+            try:
+
+                text = page.extract_text()
+
+                if text:
+                    text_parts.append(text)
+
+            except Exception:
+                pass
+
+    except Exception as e:
+
+        print(
+            f"Could not read PDF {pdf_path}: {e}"
+        )
+
+    return "\n".join(text_parts)
+
+
+# ============================================================
+# PDF DATA EXTRACTION
+# ============================================================
+
+def extract_pdf_data(pdf_path):
+    """
+    Extract ticket information from PDF.
+
+    IMPORTANT:
+    This function never inserts fake passenger/route values.
+    If something cannot be extracted, it remains blank.
+    """
+
+    text = extract_pdf_text(pdf_path)
+
+    text_upper = text.upper()
+
+    data = {
+
+        "file_name": os.path.basename(pdf_path),
+
+        "pnr": "",
+
+        "passenger_names": [],
+
+        "passenger_name": "",
+
+        "from_station": "",
+
+        "to_station": "",
+
+        "train_name": "",
+
+        "train_no": "",
+
+        "date_of_travel": "",
+
+        "train_class": "",
+
+        "class_code": "",
+
+        "quota": "",
+
+        "total_fare": None,
+
+        "mode": "",
+
+        "extraction_error": False,
+    }
+
+
+    if not text.strip():
+
+        data["extraction_error"] = True
+
+        return data
+
+
+    # ========================================================
+    # PNR
+    # ========================================================
+
+    pnr_patterns = [
+
+        r"\bPNR\s*(?:NO\.?|NUMBER)?\s*[:\-]?\s*(\d{8,12})",
+
+        r"\bPNR\s*[:\-]?\s*(\d{8,12})",
+
+    ]
+
+    for pattern in pnr_patterns:
+
+        match = re.search(
+            pattern,
             text,
-            re.I,
+            re.I
         )
-        if pay_block:
-            amounts = re.findall(r"₹\s*([0-9,]+\.[0-9]{2})", pay_block.group(1))
-            if not amounts:
-                amounts = re.findall(r"([0-9,]+\.[0-9]{2})", pay_block.group(1))
-            if amounts:
-                data["total_fare"] = float(amounts[-1].replace(",", ""))
-        else:
-            m_tf = re.search(r"Total\s+Fare[^\n\r₹Rs]*[₹Rs\.]*\s*([0-9,]+\.[0-9]{2})", text, re.I)
-            if m_tf:
-                data["total_fare"] = float(m_tf.group(1).replace(",", ""))
 
-    # Date of Travel
-    dt_m = re.search(r"Departure\*?\s*(?:\d{1,2}:\d{2}\s+)?(\d{1,2}[‐\-\s][A-Za-z]+[‐\-\s]\d{4})", text)
-    if not dt_m:
-        dt_m = re.search(r"Start\s+Date\*?\s*(\d{1,2}[‐\-\s][A-Za-z]+[‐\-\s]\d{4})", text)
-    if dt_m:
-        data["date_of_travel"] = format_date(dt_m.group(1))
+        if match:
 
-    # Quota
-    q_m = re.search(r"Quota[^\n\r]*\n\s*([A-Za-z]+)\s*(?:\([A-Z]+\))?", text, re.I)
-    if q_m:
-        data["quota"] = q_m.group(1).capitalize()
+            data["pnr"] = match.group(1).strip()
 
-    # Vendor
-    if "TBO Tek Limited" in text or "TBO" in text:
-        data["vendor"] = "TBO TEK LIMITED"
-    elif "Riya Connect" in text or "RLTC" in text:
-        data["vendor"] = "RIYA TRAVEL AND TOURS INDIA PVT LTD"
-    else:
-        data["vendor"] = "IRCTC"
+            break
+
+
+    # ========================================================
+    # DATE
+    # ========================================================
+
+    date_patterns = [
+
+        r"(?:DATE OF JOURNEY|DATE OF TRAVEL|JOURNEY DATE|TRAVEL DATE)"
+        r"\s*[:\-]?\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})",
+
+        r"\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})\b",
+
+        r"\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2})\b",
+
+    ]
+
+    for pattern in date_patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            re.I
+        )
+
+        if match:
+
+            data["date_of_travel"] = format_date(
+                match.group(1)
+            )
+
+            break
+
+
+    # ========================================================
+    # CLASS
+    # ========================================================
+
+    class_patterns = [
+
+        r"\b(1A|2A|3A|3E|SL|2S|CC|EC|EV|EA)\b",
+
+        r"(?:CLASS|TRAVEL CLASS)\s*[:\-]?\s*"
+        r"(1A|2A|3A|3E|SL|2S|CC|EC|EV|EA)",
+
+    ]
+
+    for pattern in class_patterns:
+
+        match = re.search(
+            pattern,
+            text_upper,
+            re.I
+        )
+
+        if match:
+
+            data["class_code"] = (
+                match.group(1).upper()
+            )
+
+            data["train_class"] = (
+                match.group(1).upper()
+            )
+
+            break
+
+
+    # ========================================================
+    # QUOTA
+    # ========================================================
+
+    quota_patterns = [
+
+        r"QUOTA\s*[:\-]?\s*"
+        r"([A-Z][A-Z ]+?)(?:\s*\([A-Z]+\))?(?:\n|$)",
+
+        r"\b(GENERAL|GN|LADIES|LD|TATKAL|CK|"
+        r"PREMIUM TATKAL|PT|SENIOR CITIZEN)\b",
+
+    ]
+
+    for pattern in quota_patterns:
+
+        match = re.search(
+            pattern,
+            text_upper,
+            re.I
+        )
+
+        if match:
+
+            quota = match.group(1).strip()
+
+            data["quota"] = quota
+
+            break
+
+
+    # ========================================================
+    # FARE
+    # ========================================================
+
+    fare_patterns = [
+
+        r"(?:TOTAL FARE|TOTAL AMOUNT|TOTAL PRICE)"
+        r"\s*[:\-]?\s*(?:₹|RS\.?|INR)?\s*([\d,]+(?:\.\d{1,2})?)",
+
+        r"(?:FARE|AMOUNT)"
+        r"\s*[:\-]?\s*(?:₹|RS\.?|INR)?\s*([\d,]+(?:\.\d{1,2})?)",
+
+    ]
+
+    for pattern in fare_patterns:
+
+        matches = re.findall(
+            pattern,
+            text_upper,
+            re.I
+        )
+
+        if matches:
+
+            try:
+
+                data["total_fare"] = float(
+                    matches[-1].replace(",", "")
+                )
+
+                break
+
+            except ValueError:
+                pass
+
+
+    # ========================================================
+    # TRAIN / FLIGHT / BUS NUMBER
+    # ========================================================
+
+    number_patterns = [
+
+        r"(?:TRAIN NO|TRAIN NUMBER|TRAIN)\s*[:\-]?\s*(\d{4,6})",
+
+        r"(?:FLIGHT NO|FLIGHT NUMBER|FLIGHT)\s*[:\-]?\s*"
+        r"([A-Z]{1,3}\s*\d{2,5})",
+
+        r"(?:BUS NO|BUS NUMBER|BUS)\s*[:\-]?\s*"
+        r"([A-Z0-9\-]{2,15})",
+
+    ]
+
+    for pattern in number_patterns:
+
+        match = re.search(
+            pattern,
+            text_upper,
+            re.I
+        )
+
+        if match:
+
+            data["train_no"] = (
+                match.group(1).strip()
+            )
+
+            break
+
+
+    # ========================================================
+    # TRAIN NAME
+    # ========================================================
+
+    train_patterns = [
+
+        r"(?:TRAIN NAME|TRAIN)\s*[:\-]\s*"
+        r"([A-Za-z0-9 .&()\-]+)",
+
+    ]
+
+    for pattern in train_patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            re.I
+        )
+
+        if match:
+
+            name = match.group(1).strip()
+
+            # Avoid taking a very long unrelated line
+            if len(name) <= 100:
+
+                data["train_name"] = name
+
+                break
+
+
+    # ========================================================
+    # FROM / TO
+    # ========================================================
+
+    route_patterns = [
+
+        r"(?:FROM)\s*[:\-]?\s*"
+        r"([A-Za-z .,'()\-]+?)"
+        r"\s+(?:TO)\s*[:\-]?\s*"
+        r"([A-Za-z .,'()\-]+?)(?:\n|$)",
+
+    ]
+
+    for pattern in route_patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            re.I
+        )
+
+        if match:
+
+            data["from_station"] = (
+                match.group(1).strip()
+            )
+
+            data["to_station"] = (
+                match.group(2).strip()
+            )
+
+            break
+
+
+    # ========================================================
+    # PASSENGER NAMES
+    # ========================================================
+
+    passenger_patterns = [
+
+        r"(?:PASSENGER NAME|PASSENGER|NAME)"
+        r"\s*[:\-]\s*([A-Za-z .]+)",
+
+    ]
+
+    for pattern in passenger_patterns:
+
+        matches = re.findall(
+            pattern,
+            text,
+            re.I
+        )
+
+        for name in matches:
+
+            name = name.strip()
+
+            if (
+                len(name) >= 3
+                and len(name) <= 80
+                and not re.search(
+                    r"PNR|DATE|TRAIN|CLASS|QUOTA|FARE|"
+                    r"FROM|TO|AGE|GENDER",
+                    name,
+                    re.I
+                )
+            ):
+
+                data["passenger_names"].append(
+                    name
+                )
+
+
+    # Remove duplicates
+    data["passenger_names"] = list(
+        dict.fromkeys(
+            data["passenger_names"]
+        )
+    )
+
+
+    if data["passenger_names"]:
+
+        data["passenger_name"] = (
+            data["passenger_names"][0]
+        )
+
+
+    # ========================================================
+    # MODE
+    # ========================================================
+
+    if (
+        "FLIGHT" in text_upper
+        or "AIRLINE" in text_upper
+        or "BOARDING PASS" in text_upper
+    ):
+
+        data["mode"] = "FLIGHT"
+
+    elif (
+        "TRAIN" in text_upper
+        or "RAILWAY" in text_upper
+        or "IRCTC" in text_upper
+    ):
+
+        data["mode"] = "TRAIN"
+
+    elif "BUS" in text_upper:
+
+        data["mode"] = "BUS"
+
 
     return data
 
 
+# ============================================================
+# EXCEL COLUMN MAPPING
+# ============================================================
+
+def get_column_map(ws):
+    """
+    Map Excel headers to column numbers.
+    """
+
+    column_map = {}
+
+    for col in range(
+        1,
+        ws.max_column + 1
+    ):
+
+        value = ws.cell(
+            1,
+            col
+        ).value
+
+        if value is None:
+            continue
+
+        header = normalize_value(
+            value
+        )
+
+        column_map[header] = col
+
+    return column_map
+
+
+# ============================================================
+# FIND HEADER
+# ============================================================
+
+def find_column(column_map, *names):
+    """
+    Find a column using multiple possible names.
+    """
+
+    for name in names:
+
+        normalized = normalize_value(
+            name
+        )
+
+        if normalized in column_map:
+
+            return column_map[
+                normalized
+            ]
+
+    return None
+
+
+# ============================================================
+# MAIN AUDIT FUNCTION
+# ============================================================
+
 def audit_tickets(
-    excel_path: str = "MIS_Data_Report_27 Sept 2026.xlsx",
-    tickets_dir: str = "testticket",
-    output_path: str = "MIS_Report_Audited.xlsx",
-    progress_callback=None,
+    excel_path,
+    tickets_dir,
+    output_path=None
 ):
-    """Main entry point executing the reconciliation, Excel highlighting, and summary report."""
-    print("=" * 65)
-    print("        DAILY TICKET RECONCILIATION & AUDIT PROCESS")
-    print("=" * 65)
+    """
+    Main ticket auditing function.
 
-    if progress_callback:
-        progress_callback({"phase": "init", "percent": 5, "message": "Locating ticket PDFs..."})
+    Parameters:
+        excel_path:
+            Path to MIS Excel file.
 
-    # 1. Scan all PDFs in 'testticket/'
-    pdf_files = sorted(glob.glob(os.path.join(tickets_dir, "*.pdf")))
+        tickets_dir:
+            Folder containing ticket PDFs.
+
+        output_path:
+            Where audited Excel should be saved.
+
+    Returns:
+        Dictionary containing saved file details.
+    """
+
+    excel_path = Path(
+        excel_path
+    )
+
+    tickets_dir = Path(
+        tickets_dir
+    )
+
+
+    if output_path:
+
+        output_path = Path(
+            output_path
+        )
+
+    else:
+
+        output_path = (
+            excel_path.parent
+            / f"Audited_{excel_path.name}"
+        )
+
+
+    # ========================================================
+    # LOAD EXCEL
+    # ========================================================
+
+    wb = load_workbook(
+        excel_path
+    )
+
+    ws = wb.active
+
+
+    column_map = get_column_map(
+        ws
+    )
+
+
+    # ========================================================
+    # FIND IMPORTANT COLUMNS
+    # ========================================================
+
+    col_pnr = find_column(
+        column_map,
+        "PNR",
+        "PNR NO",
+        "PNR NUMBER"
+    )
+
+    col_passenger = find_column(
+        column_map,
+        "PASSENGER NAME",
+        "PASSENGER",
+        "NAME"
+    )
+
+    col_from = find_column(
+        column_map,
+        "FROM",
+        "FROM STATION",
+        "SOURCE"
+    )
+
+    col_to = find_column(
+        column_map,
+        "TO",
+        "TO STATION",
+        "DESTINATION"
+    )
+
+    col_mode = find_column(
+        column_map,
+        "MODE",
+        "TRAVEL MODE"
+    )
+
+    col_train_name = find_column(
+        column_map,
+        "TRAIN_NAME",
+        "TRAIN NAME",
+        "FLIGHT NAME",
+        "BUS NAME"
+    )
+
+    col_train_no = find_column(
+        column_map,
+        "TRAIN_NO",
+        "TRAIN NO",
+        "TRAIN NUMBER",
+        "FLIGHT NO",
+        "FLIGHT NUMBER",
+        "BUS NO"
+    )
+
+    col_date = find_column(
+        column_map,
+        "DATE_OF_TRAVEL",
+        "DATE OF TRAVEL",
+        "TRAVEL DATE",
+        "JOURNEY DATE"
+    )
+
+    col_class = find_column(
+        column_map,
+        "CLASS",
+        "TRAIN CLASS",
+        "TRAVEL CLASS"
+    )
+
+    col_quota = find_column(
+        column_map,
+        "QUOTA"
+    )
+
+    col_fare = find_column(
+        column_map,
+        "FARE",
+        "TICKET FARE",
+        "AMOUNT",
+        "TICKET AMOUNT",
+        "TOTAL AMOUNT"
+    )
+
+
+    # ========================================================
+    # REMARK COLUMN
+    # ========================================================
+
+    remark_col = find_column(
+        column_map,
+        "REMARKS",
+        "REMARK",
+        "AUDIT REMARKS",
+        "AUDIT REMARK"
+    )
+
+    if remark_col is None:
+
+        remark_col = (
+            ws.max_column + 1
+        )
+
+        ws.cell(
+            1,
+            remark_col
+        ).value = "Audit Remarks"
+
+        ws.cell(
+            1,
+            remark_col
+        ).font = Font(
+            bold=True
+        )
+
+
+    # ========================================================
+    # READ ALL PDF FILES
+    # ========================================================
+
+    pdf_files = list(
+        tickets_dir.glob("*.pdf")
+    )
+
     pdf_records = {}
-    total_files = len(pdf_files)
 
-    for idx, pdf_file in enumerate(pdf_files, 1):
-        p_data = extract_pdf_data(pdf_file)
-        if p_data["pnr"]:
-            pdf_records[p_data["pnr"]] = p_data
-        if progress_callback and total_files > 0:
-            pct = 5 + int((idx / total_files) * 35)
-            progress_callback({
-                "phase": "scanning_pdfs",
-                "percent": pct,
-                "current": idx,
-                "total": total_files,
-                "message": f"Scanning PDF {idx}/{total_files}: {os.path.basename(pdf_file)}"
-            })
+    pdf_without_pnr = []
 
-    total_pdfs_processed = len(pdf_records)
-    print(f"[*] Total PDFs scanned & processed: {total_pdfs_processed}")
+    duplicate_pnrs = []
 
-    if progress_callback:
-        progress_callback({"phase": "loading_excel", "percent": 45, "message": "Loading MIS Excel workbook..."})
 
-    # 2. Load Excel Workbook
-    wb = openpyxl.load_workbook(excel_path)
-    sheet_name = "MIS Report" if "MIS Report" in wb.sheetnames else wb.sheetnames[0]
-    ws = wb[sheet_name]
+    for pdf_path in pdf_files:
 
-    # Map headers dynamically
-    col_map = {}
-    for col in range(1, ws.max_column + 1):
-        val = str(ws.cell(1, col).value or "").strip()
-        if not val:
-            continue
-        uval = val.upper()
-        if "PNR" in uval:
-            col_map["PNR"] = col
-        elif "TRAIN_BUS_FLIGHT_NAME" in uval or "TRAIN NAME" in uval:
-            col_map["TRAIN_NAME"] = col
-        elif "TRAIN_BUS_FLIGHT_NUMBER" in uval or "TRAIN NO" in uval:
-            col_map["TRAIN_NO"] = col
-        elif "DATE OF TRAVEL" in uval:
-            col_map["DATE_OF_TRAVEL"] = col
-        elif "PASSENGER NAME" in uval or "PAX" in uval:
-            col_map["PASSENGER"] = col
-        elif uval == "FROM":
-            col_map["FROM"] = col
-        elif uval == "TO":
-            col_map["TO"] = col
-        elif uval == "CLASS":
-            col_map["CLASS"] = col
-        elif uval == "QUOTA":
-            col_map["QUOTA"] = col
-        elif "TICKET AMOUNT" in uval or "FARE" in uval:
-            col_map["FARE"] = col
-        elif "TOTAL AMOUNT" in uval:
-            col_map["TOTAL_AMOUNT"] = col
-        elif uval == "MODE":
-            col_map["MODE"] = col
-        elif "VENDOR" in uval:
-            col_map["VENDOR"] = col
-        elif uval == "STATUS":
-            col_map["STATUS"] = col
+        print(
+            f"Reading PDF: {pdf_path.name}"
+        )
 
-    # Determine Audit Status & Remarks Column
-    audit_col = ws.max_column + 1
-    for col in range(1, ws.max_column + 1):
-        if ws.cell(1, col).value == "Audit Status & Remarks":
-            audit_col = col
-            break
+        pdf_data = extract_pdf_data(
+            pdf_path
+        )
 
-    header_cell = ws.cell(1, audit_col)
-    header_cell.value = "Audit Status & Remarks"
-    header_cell.font = Font(name="Calibri", size=11, bold=True)
-    header_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        pnr = pdf_data["pnr"]
 
-    # 3. Two-Way Reconciliation
-    matched_count = 0
-    discrepancies_count = 0
-    unprinted_count = 0
-    excel_pnrs_seen = set()
-    total_excel_rows = ws.max_row - 1
 
-    discrepancy_details = []
-    unprinted_details = []
-    matched_details = []
-    unrecorded_details = []
+        if not pnr:
 
-    for r in range(2, ws.max_row + 1):
-        pnr_val = ws.cell(r, col_map["PNR"]).value
-        if not pnr_val:
+            pdf_without_pnr.append(
+                pdf_data
+            )
+
             continue
 
-        excel_pnr = str(pnr_val).strip()
-        excel_pnrs_seen.add(excel_pnr)
 
-        if progress_callback and total_excel_rows > 0:
-            pct = 45 + int(((r - 1) / total_excel_rows) * 40)
-            progress_callback({
-                "phase": "reconciling",
-                "percent": pct,
-                "current": r - 1,
-                "total": total_excel_rows,
-                "message": f"Reconciling row {r - 1}/{total_excel_rows} (PNR {excel_pnr})"
-            })
+        if pnr in pdf_records:
 
-        # Check if PNR is present in testticket/
-        if excel_pnr not in pdf_records:
-            unprinted_count += 1
-            ws.cell(r, col_map["PNR"]).fill = FILL_RED
-            audit_cell = ws.cell(r, audit_col)
-            audit_cell.value = "Ticket Not Printed / Missing PDF"
-            audit_cell.fill = FILL_RED
+            duplicate_pnrs.append(
+                pnr
+            )
 
-            unprinted_details.append({
-                "row": r,
-                "pnr": excel_pnr,
-                "mode": ws.cell(r, col_map.get("MODE", 6)).value,
-                "passenger": ws.cell(r, col_map.get("PASSENGER", 10)).value,
-                "train": ws.cell(r, col_map.get("TRAIN_NAME", 7)).value,
-                "from": ws.cell(r, col_map.get("FROM", 14)).value,
-                "to": ws.cell(r, col_map.get("TO", 15)).value,
-                "fare": ws.cell(r, col_map.get("FARE", 18)).value,
-                "status": "Ticket Not Printed / Missing PDF"
-            })
             continue
 
-        # Matched PNR in testticket/ -> Check parity
-        pdf = pdf_records[excel_pnr]
+
+        pdf_records[pnr] = pdf_data
+
+
+    # ========================================================
+    # AUDIT EACH MIS ROW
+    # ========================================================
+
+    matched_mis_pnrs = set()
+
+
+    for row in range(
+        2,
+        ws.max_row + 1
+    ):
+
         row_discrepancies = []
-        has_station_mismatch = False
+
+        has_red_error = False
+
         has_yellow_discrepancy = False
 
-        # a) Route Check - From Station
-        excel_from = ws.cell(r, col_map["FROM"]).value
-        from_match, from_rem = compare_stations(excel_from, pdf["from_station"], "From station")
-        if not from_match:
-            has_station_mismatch = True
-            ws.cell(r, col_map["FROM"]).fill = FILL_RED
-            row_discrepancies.append(from_rem)
 
-        # b) Route Check - To Station
-        excel_to = ws.cell(r, col_map["TO"]).value
-        to_match, to_rem = compare_stations(excel_to, pdf["to_station"], "To station")
-        if not to_match:
-            has_station_mismatch = True
-            ws.cell(r, col_map["TO"]).fill = FILL_RED
-            row_discrepancies.append(to_rem)
+        # ----------------------------------------------------
+        # GET MIS PNR
+        # ----------------------------------------------------
 
-        # c) Passenger Name Check
-        excel_pax = ws.cell(r, col_map["PASSENGER"]).value
-        pax_match, pax_rem = compare_passengers(excel_pax, pdf["passenger_names"])
-        if not pax_match:
-            has_yellow_discrepancy = True
-            ws.cell(r, col_map["PASSENGER"]).fill = FILL_YELLOW
-            row_discrepancies.append(pax_rem)
+        excel_pnr = ""
 
-        # d) Train Name / Formatting Check
-        excel_train = ws.cell(r, col_map["TRAIN_NAME"]).value
-        train_match, train_rem = compare_train(excel_train, pdf["train_name"], pdf["train_class"])
-        if not train_match:
-            has_yellow_discrepancy = True
-            ws.cell(r, col_map["TRAIN_NAME"]).fill = FILL_YELLOW
-            row_discrepancies.append(train_rem)
+        if col_pnr:
 
-        # e) Fare Check
-        excel_fare = ws.cell(r, col_map["FARE"]).value
-        if excel_fare is not None and pdf["total_fare"] is not None:
-            try:
-                ef = float(str(excel_fare).replace(",", "").strip())
-                pf = float(pdf["total_fare"])
-                num_pax = max(1, len(pdf["passenger_names"]))
-                # Check both full ticket fare and per-passenger split
-                if abs(ef - pf) > 0.05 and abs(ef * num_pax - pf) > 0.05 and abs(ef - (pf / num_pax)) > 0.05:
-                    has_yellow_discrepancy = True
-                    ws.cell(r, col_map["FARE"]).fill = FILL_YELLOW
-                    row_discrepancies.append(f"Fare difference: Excel ₹{ef:.2f} vs PDF ₹{pf:.2f}")
-            except ValueError:
-                pass
+            excel_pnr = normalize_value(
+                ws.cell(
+                    row,
+                    col_pnr
+                ).value
+            )
 
-        audit_cell = ws.cell(r, audit_col)
-        if row_discrepancies:
-            discrepancies_count += 1
-            rem_text = "; ".join(row_discrepancies)
-            audit_cell.value = f"Discrepancy: {rem_text}"
-            audit_cell.fill = FILL_RED if has_station_mismatch else FILL_YELLOW
 
-            discrepancy_details.append({
-                "row": r,
-                "pnr": excel_pnr,
-                "mode": ws.cell(r, col_map.get("MODE", 6)).value,
-                "passenger": excel_pax,
-                "train": excel_train,
-                "from": excel_from,
-                "to": excel_to,
-                "fare": excel_fare,
-                "pdf_passenger": pdf["passenger_name"],
-                "pdf_train": pdf["train_name"],
-                "pdf_from": pdf["from_station"],
-                "pdf_to": pdf["to_station"],
-                "pdf_fare": pdf["total_fare"],
-                "remarks": row_discrepancies,
-                "has_station_mismatch": has_station_mismatch,
-            })
+        if not excel_pnr:
+
+            ws.cell(
+                row,
+                remark_col
+            ).value = (
+                "Manual Review: PNR missing from MIS"
+            )
+
+            ws.cell(
+                row,
+                remark_col
+            ).fill = FILL_RED
+
+            continue
+
+
+        # ----------------------------------------------------
+        # FIND PDF
+        # ----------------------------------------------------
+
+        if excel_pnr not in pdf_records:
+
+            ws.cell(
+                row,
+                remark_col
+            ).value = (
+                "Ticket PDF not found for PNR "
+                + excel_pnr
+            )
+
+            ws.cell(
+                row,
+                remark_col
+            ).fill = FILL_RED
+
+            continue
+
+
+        matched_mis_pnrs.add(
+            excel_pnr
+        )
+
+
+        pdf = pdf_records[
+            excel_pnr
+        ]
+
+
+        # ----------------------------------------------------
+        # PASSENGER
+        # ----------------------------------------------------
+
+        if col_passenger:
+
+            excel_passenger = (
+                ws.cell(
+                    row,
+                    col_passenger
+                ).value
+            )
+
+            match, remark = compare_passenger(
+                excel_passenger,
+                pdf["passenger_names"]
+            )
+
+            if not match:
+
+                has_yellow_discrepancy = True
+
+                row_discrepancies.append(
+                    remark
+                )
+
+                ws.cell(
+                    row,
+                    col_passenger
+                ).fill = FILL_YELLOW
+
+
+        # ----------------------------------------------------
+        # FROM
+        # ----------------------------------------------------
+
+        if col_from:
+
+            excel_from = (
+                ws.cell(
+                    row,
+                    col_from
+                ).value
+            )
+
+            match, remark = compare_text(
+                excel_from,
+                pdf["from_station"],
+                "From"
+            )
+
+            if not match:
+
+                has_yellow_discrepancy = True
+
+                row_discrepancies.append(
+                    remark
+                )
+
+                ws.cell(
+                    row,
+                    col_from
+                ).fill = FILL_YELLOW
+
+
+        # ----------------------------------------------------
+        # TO
+        # ----------------------------------------------------
+
+        if col_to:
+
+            excel_to = (
+                ws.cell(
+                    row,
+                    col_to
+                ).value
+            )
+
+            match, remark = compare_text(
+                excel_to,
+                pdf["to_station"],
+                "To"
+            )
+
+            if not match:
+
+                has_yellow_discrepancy = True
+
+                row_discrepancies.append(
+                    remark
+                )
+
+                ws.cell(
+                    row,
+                    col_to
+                ).fill = FILL_YELLOW
+
+
+        # ----------------------------------------------------
+        # MODE
+        # ----------------------------------------------------
+
+        if col_mode:
+
+            excel_mode = (
+                ws.cell(
+                    row,
+                    col_mode
+                ).value
+            )
+
+            match, remark = compare_text(
+                excel_mode,
+                pdf["mode"],
+                "Mode"
+            )
+
+            if not match:
+
+                has_yellow_discrepancy = True
+
+                row_discrepancies.append(
+                    remark
+                )
+
+                ws.cell(
+                    row,
+                    col_mode
+                ).fill = FILL_YELLOW
+
+
+        # ----------------------------------------------------
+        # TRAIN / FLIGHT / BUS NAME
+        # ----------------------------------------------------
+
+        if col_train_name:
+
+            excel_train = (
+                ws.cell(
+                    row,
+                    col_train_name
+                ).value
+            )
+
+            match, remark = compare_train(
+                excel_train,
+                pdf["train_name"],
+                pdf["train_class"]
+            )
+
+            if not match:
+
+                has_yellow_discrepancy = True
+
+                row_discrepancies.append(
+                    remark
+                )
+
+                ws.cell(
+                    row,
+                    col_train_name
+                ).fill = FILL_YELLOW
+
+
+        # ----------------------------------------------------
+        # TRAIN / FLIGHT / BUS NUMBER
+        # ----------------------------------------------------
+
+        if col_train_no:
+
+            excel_train_no = (
+                ws.cell(
+                    row,
+                    col_train_no
+                ).value
+            )
+
+            match, remark = compare_text(
+                excel_train_no,
+                pdf["train_no"],
+                "Train/Flight/Bus number"
+            )
+
+            if not match:
+
+                has_yellow_discrepancy = True
+
+                row_discrepancies.append(
+                    remark
+                )
+
+                ws.cell(
+                    row,
+                    col_train_no
+                ).fill = FILL_YELLOW
+
+
+        # ----------------------------------------------------
+        # DATE
+        # ----------------------------------------------------
+
+        if col_date:
+
+            excel_date = (
+                ws.cell(
+                    row,
+                    col_date
+                ).value
+            )
+
+            match, remark = compare_date(
+                excel_date,
+                pdf["date_of_travel"]
+            )
+
+            if not match:
+
+                has_yellow_discrepancy = True
+
+                row_discrepancies.append(
+                    remark
+                )
+
+                ws.cell(
+                    row,
+                    col_date
+                ).fill = FILL_YELLOW
+
+
+        # ----------------------------------------------------
+        # CLASS
+        # ----------------------------------------------------
+
+        if col_class:
+
+            excel_class = (
+                ws.cell(
+                    row,
+                    col_class
+                ).value
+            )
+
+            match, remark = compare_class(
+                excel_class,
+                pdf["train_class"],
+                pdf["class_code"]
+            )
+
+            if not match:
+
+                has_yellow_discrepancy = True
+
+                row_discrepancies.append(
+                    remark
+                )
+
+                ws.cell(
+                    row,
+                    col_class
+                ).fill = FILL_YELLOW
+
+
+        # ----------------------------------------------------
+        # QUOTA
+        # ----------------------------------------------------
+
+        if col_quota:
+
+            excel_quota = (
+                ws.cell(
+                    row,
+                    col_quota
+                ).value
+            )
+
+            match, remark = compare_quota(
+                excel_quota,
+                pdf["quota"]
+            )
+
+            if not match:
+
+                has_yellow_discrepancy = True
+
+                row_discrepancies.append(
+                    remark
+                )
+
+                ws.cell(
+                    row,
+                    col_quota
+                ).fill = FILL_YELLOW
+
+
+        # ----------------------------------------------------
+        # FARE
+        # ----------------------------------------------------
+
+        if col_fare:
+
+            excel_fare = (
+                ws.cell(
+                    row,
+                    col_fare
+                ).value
+            )
+
+            passenger_count = max(
+                1,
+                len(
+                    pdf["passenger_names"]
+                )
+            )
+
+            match, remark = compare_fare(
+                excel_fare,
+                pdf["total_fare"],
+                passenger_count
+            )
+
+            if not match:
+
+                has_yellow_discrepancy = True
+
+                row_discrepancies.append(
+                    remark
+                )
+
+                ws.cell(
+                    row,
+                    col_fare
+                ).fill = FILL_YELLOW
+
+
+        # ----------------------------------------------------
+        # FINAL REMARK
+        # ----------------------------------------------------
+
+        if has_red_error:
+
+            final_remark = (
+                "Critical audit error"
+            )
+
+            ws.cell(
+                row,
+                remark_col
+            ).fill = FILL_RED
+
+        elif has_yellow_discrepancy:
+
+            final_remark = (
+                "Discrepancy: "
+                + "; ".join(
+                    row_discrepancies
+                )
+            )
+
+            ws.cell(
+                row,
+                remark_col
+            ).fill = FILL_YELLOW
+
         else:
-            matched_count += 1
-            audit_cell.value = "Matched"
-            audit_cell.fill = FILL_GREEN
 
-            matched_details.append({
-                "row": r,
-                "pnr": excel_pnr,
-                "mode": ws.cell(r, col_map.get("MODE", 6)).value,
-                "passenger": excel_pax,
-                "train": excel_train,
-                "from": excel_from,
-                "to": excel_to,
-                "fare": excel_fare,
-                "status": "Matched"
-            })
+            final_remark = "Matched"
 
-    # 4. Handle Unrecorded Bookings (PDFs present in folder but missing in Excel)
-    if progress_callback:
-        progress_callback({"phase": "unrecorded", "percent": 90, "message": "Appending unrecorded tickets..."})
+            ws.cell(
+                row,
+                remark_col
+            ).fill = FILL_GREEN
 
-    unrecorded_pnrs = [pnr for pnr in pdf_records if pnr not in excel_pnrs_seen]
-    unrecorded_count = len(unrecorded_pnrs)
 
-    for pnr in unrecorded_pnrs:
-        pdf = pdf_records[pnr]
-        new_row = ws.max_row + 1
+        ws.cell(
+            row,
+            remark_col
+        ).value = final_remark
 
-        if "PNR" in col_map:
-            ws.cell(new_row, col_map["PNR"]).value = pdf["pnr"]
-        if "MODE" in col_map:
-            ws.cell(new_row, col_map["MODE"]).value = pdf["mode"]
-        if "TRAIN_NAME" in col_map:
-            ws.cell(new_row, col_map["TRAIN_NAME"]).value = pdf["train_name"]
-        if "TRAIN_NO" in col_map:
-            ws.cell(new_row, col_map["TRAIN_NO"]).value = pdf["train_no"]
-        if "DATE_OF_TRAVEL" in col_map:
-            ws.cell(new_row, col_map["DATE_OF_TRAVEL"]).value = pdf["date_of_travel"]
-        if "PASSENGER" in col_map:
-            ws.cell(new_row, col_map["PASSENGER"]).value = pdf["passenger_name"]
-        if "FROM" in col_map:
-            ws.cell(new_row, col_map["FROM"]).value = pdf["from_station"]
-        if "TO" in col_map:
-            ws.cell(new_row, col_map["TO"]).value = pdf["to_station"]
-        if "CLASS" in col_map:
-            ws.cell(new_row, col_map["CLASS"]).value = pdf["class_code"] or pdf["train_class"]
-        if "QUOTA" in col_map:
-            ws.cell(new_row, col_map["QUOTA"]).value = pdf["quota"]
-        if "FARE" in col_map:
-            ws.cell(new_row, col_map["FARE"]).value = pdf["total_fare"]
-        if "TOTAL_AMOUNT" in col_map:
-            ws.cell(new_row, col_map["TOTAL_AMOUNT"]).value = pdf["total_fare"]
-        if "VENDOR" in col_map:
-            ws.cell(new_row, col_map["VENDOR"]).value = pdf["vendor"]
-        if "STATUS" in col_map:
-            ws.cell(new_row, col_map["STATUS"]).value = "Booked"
 
-        audit_cell = ws.cell(new_row, audit_col)
-        audit_cell.value = "Found in PDF Folder, Missing in Excel (Unrecorded Ticket)"
+    # ========================================================
+    # FIND PDFs NOT PRESENT IN MIS
+    # ========================================================
 
-        # Highlight entire new row in Light Blue (#D9E1F2)
-        for col_idx in range(1, audit_col + 1):
-            c = ws.cell(new_row, col_idx)
-            c.fill = FILL_LIGHT_BLUE
-            c.font = Font(name="Calibri", size=11)
+    extra_pdfs = []
 
-        unrecorded_details.append({
-            "row": new_row,
-            "pnr": pdf["pnr"],
-            "mode": pdf["mode"],
-            "passenger": pdf["passenger_name"],
-            "train": pdf["train_name"],
-            "from": pdf["from_station"],
-            "to": pdf["to_station"],
-            "fare": pdf["total_fare"],
-            "status": "Found in PDF Folder, Missing in Excel (Unrecorded Ticket)"
-        })
+    for pnr, pdf_data in pdf_records.items():
 
-    # Adjust column width
-    col_letter = get_column_letter(audit_col)
-    ws.column_dimensions[col_letter].width = 56
+        if pnr not in matched_mis_pnrs:
 
-    if progress_callback:
-        progress_callback({"phase": "saving", "percent": 96, "message": "Saving audited workbook..."})
+            extra_pdfs.append(
+                pdf_data
+            )
 
-    # 5. Handle File Locks on Save
-    saved_file = output_path
-    try:
-        wb.save(saved_file)
-    except PermissionError:
-        p = Path(output_path)
-        saved_file = str(p.parent / f"{p.stem}_Updated{p.suffix}")
-        wb.save(saved_file)
-        print(f"[!] Warning: '{output_path}' is open/locked by Excel. Saved as '{saved_file}' instead.")
 
-    print(f"\n[+] Successfully saved audited report to '{saved_file}'")
+    # ========================================================
+    # ADD AUDIT SUMMARY SHEET
+    # ========================================================
 
-    # 6. Console Summary Table
-    print("\n" + "=" * 65)
-    print("               TWO-WAY RECONCILIATION SUMMARY")
-    print("=" * 65)
-    print(f"  {'Metric':<48} {'Count':>10}")
-    print("-" * 65)
-    print(f"  {'Total rows in Excel':<48} {total_excel_rows:>10}")
-    print(f"  {'Total PDFs processed in \'testticket/\'':<48} {total_pdfs_processed:>10}")
-    print(f"  {'Matched count':<48} {matched_count:>10}")
-    print(f"  {'Discrepancies count':<48} {discrepancies_count:>10}")
-    print(f"  {'Unprinted (missing PDF) count':<48} {unprinted_count:>10}")
-    print(f"  {'Unrecorded (missing in Excel) count':<48} {unrecorded_count:>10}")
-    print("=" * 65)
+    if "Audit Summary" in wb.sheetnames:
 
-    if progress_callback:
-        progress_callback({"phase": "done", "percent": 100, "message": "Audit completed successfully!"})
+        del wb["Audit Summary"]
+
+
+    summary = wb.create_sheet(
+        "Audit Summary"
+    )
+
+
+    summary["A1"] = "Ticket Audit Summary"
+
+    summary["A1"].font = Font(
+        bold=True,
+        size=16
+    )
+
+
+    summary_data = [
+
+        (
+            "MIS Tickets",
+            ws.max_row - 1
+        ),
+
+        (
+            "PDF Tickets",
+            len(pdf_files)
+        ),
+
+        (
+            "Matched PNRs",
+            len(matched_mis_pnrs)
+        ),
+
+        (
+            "Missing PDF Tickets",
+            (ws.max_row - 1)
+            - len(matched_mis_pnrs)
+        ),
+
+        (
+            "PDFs Not Present in MIS",
+            len(extra_pdfs)
+        ),
+
+        (
+            "PDFs Without PNR",
+            len(pdf_without_pnr)
+        ),
+
+        (
+            "Duplicate PNRs",
+            len(duplicate_pnrs)
+        ),
+
+    ]
+
+
+    start_row = 3
+
+
+    for index, (label, value) in enumerate(
+        summary_data,
+        start=start_row
+    ):
+
+        summary.cell(
+            index,
+            1
+        ).value = label
+
+        summary.cell(
+            index,
+            2
+        ).value = value
+
+
+    # ========================================================
+    # EXTRA PDF SECTION
+    # ========================================================
+
+    row = start_row + len(
+        summary_data
+    ) + 2
+
+
+    summary.cell(
+        row,
+        1
+    ).value = "PDFs Not Present in MIS"
+
+    summary.cell(
+        row,
+        1
+    ).font = Font(
+        bold=True
+    )
+
+
+    row += 1
+
+
+    for pdf_data in extra_pdfs:
+
+        summary.cell(
+            row,
+            1
+        ).value = pdf_data["pnr"]
+
+        summary.cell(
+            row,
+            2
+        ).value = pdf_data["file_name"]
+
+        row += 1
+
+
+    # ========================================================
+    # PDFs WITHOUT PNR
+    # ========================================================
+
+    row += 1
+
+
+    summary.cell(
+        row,
+        1
+    ).value = "PDFs Where PNR Could Not Be Extracted"
+
+    summary.cell(
+        row,
+        1
+    ).font = Font(
+        bold=True
+    )
+
+
+    row += 1
+
+
+    for pdf_data in pdf_without_pnr:
+
+        summary.cell(
+            row,
+            1
+        ).value = pdf_data["file_name"]
+
+        summary.cell(
+            row,
+            2
+        ).value = (
+            "Manual Review Required"
+        )
+
+        row += 1
+
+
+    # ========================================================
+    # DUPLICATE PNRS
+    # ========================================================
+
+    row += 1
+
+
+    summary.cell(
+        row,
+        1
+    ).value = "Duplicate PNRs"
+
+    summary.cell(
+        row,
+        1
+    ).font = Font(
+        bold=True
+    )
+
+
+    row += 1
+
+
+    for pnr in duplicate_pnrs:
+
+        summary.cell(
+            row,
+            1
+        ).value = pnr
+
+        summary.cell(
+            row,
+            2
+        ).value = (
+            "Duplicate PNR found in PDFs"
+        )
+
+        row += 1
+
+
+    # ========================================================
+    # FORMAT SUMMARY
+    # ========================================================
+
+    for column in summary.columns:
+
+        max_length = 0
+
+        column_letter = (
+            column[0].column_letter
+        )
+
+        for cell in column:
+
+            if cell.value is not None:
+
+                max_length = max(
+                    max_length,
+                    len(str(cell.value))
+                )
+
+        summary.column_dimensions[
+            column_letter
+        ].width = min(
+            max_length + 2,
+            60
+        )
+
+
+    # ========================================================
+    # SAVE
+    # ========================================================
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+
+    wb.save(
+        output_path
+    )
+
+
+    print(
+        f"\nAudit completed successfully."
+    )
+
+    print(
+        f"Saved file: {output_path}"
+    )
+
 
     return {
-        "total_excel_rows": total_excel_rows,
-        "total_pdfs_processed": total_pdfs_processed,
-        "matched_count": matched_count,
-        "discrepancies_count": discrepancies_count,
-        "unprinted_count": unprinted_count,
-        "unrecorded_count": unrecorded_count,
-        "saved_file": saved_file,
-        "saved_filename": os.path.basename(saved_file),
-        "discrepancies": discrepancy_details,
-        "unprinted": unprinted_details,
-        "unrecorded": unrecorded_details,
-        "matched": matched_details,
+
+        "saved_file": str(
+            output_path
+        ),
+
+        "saved_filename": (
+            output_path.name
+        ),
+
+        "mis_tickets": (
+            ws.max_row - 1
+        ),
+
+        "pdf_tickets": len(
+            pdf_files
+        ),
+
+        "matched": len(
+            matched_mis_pnrs
+        ),
+
+        "missing_pdf": (
+            (ws.max_row - 1)
+            - len(matched_mis_pnrs)
+        ),
+
+        "extra_pdf": len(
+            extra_pdfs
+        ),
+
+        "pdf_without_pnr": len(
+            pdf_without_pnr
+        ),
+
+        "duplicate_pnr": len(
+            duplicate_pnrs
+        ),
     }
 
 
+# ============================================================
+# RUN DIRECTLY
+# ============================================================
+
 if __name__ == "__main__":
-    audit_tickets()
+
+    print(
+        "audit_tickets.py"
+    )
+
+    print(
+        "This file contains the ticket auditing engine."
+    )
+
+    print(
+        "Use audit_tickets() from app.py to run the audit."
+    )
