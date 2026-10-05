@@ -94,23 +94,6 @@ def compare_date(excel_date, pdf_date):
 # TEXT COMPARISON
 # ============================================================
 
-def compare_text(excel_value, pdf_value, field_name):
-    """Compare two text values."""
-    excel_value = normalize_value(excel_value)
-    pdf_value = normalize_value(pdf_value)
-
-    if not excel_value or not pdf_value:
-        return True, None  # Skip if either is missing to prevent false alerts
-
-    if excel_value == pdf_value:
-        return True, None
-
-    if excel_value in pdf_value or pdf_value in excel_value:
-        return True, None
-
-    return False, f"{field_name} mismatch: PDF has '{pdf_value}' vs Excel '{excel_value}'"
-
-
 def compare_station(excel_val, pdf_val, field_label):
     """Compare station/city origin or destination."""
     excel_norm = normalize_value(excel_val)
@@ -153,109 +136,6 @@ def compare_passenger(excel_name, pdf_names):
 
 
 # ============================================================
-# CLASS NORMALIZATION
-# ============================================================
-
-def normalize_class(value):
-    """Normalize railway/travel class values."""
-    if not value:
-        return ""
-    value = normalize_value(value)
-    aliases = {
-        "AC 3 TIER": "3A", "THIRD AC": "3A", "3A": "3A",
-        "AC 2 TIER": "2A", "SECOND AC": "2A", "2A": "2A",
-        "AC FIRST CLASS": "1A", "FIRST AC": "1A", "1A": "1A",
-        "SLEEPER": "SL", "SL": "SL",
-        "SECOND SITTING": "2S", "2S": "2S",
-        "CHAIR CAR": "CC", "AC CHAIR CAR": "CC", "CC": "CC",
-        "EXECUTIVE CLASS": "EC", "EC": "EC",
-    }
-    return aliases.get(value, value)
-
-
-def compare_class(excel_class, pdf_class, pdf_class_code):
-    """Compare MIS class against PDF class."""
-    excel_class = normalize_class(excel_class)
-    pdf_final = normalize_class(pdf_class) or normalize_class(pdf_class_code)
-
-    if not excel_class or not pdf_final:
-        return True, None
-
-    if excel_class == pdf_final:
-        return True, None
-
-    return False, f"Class Mismatch: Excel '{excel_class}' vs PDF '{pdf_final}'"
-
-
-# ============================================================
-# QUOTA
-# ============================================================
-
-def normalize_quota(value):
-    """Normalize railway quota values."""
-    if not value:
-        return ""
-    value = normalize_value(value)
-    aliases = {
-        "GENERAL": "GENERAL", "GN": "GENERAL",
-        "TATKAL": "TATKAL", "CK": "TATKAL",
-        "PREMIUM TATKAL": "PREMIUM TATKAL", "PT": "PREMIUM TATKAL",
-        "LADIES": "LADIES", "LD": "LADIES"
-    }
-    return aliases.get(value, value)
-
-
-def compare_quota(excel_quota, pdf_quota):
-    """Compare MIS quota against PDF quota."""
-    excel_quota = normalize_quota(excel_quota)
-    pdf_quota = normalize_quota(pdf_quota)
-
-    if not excel_quota or not pdf_quota:
-        return True, None
-
-    if excel_quota == pdf_quota:
-        return True, None
-
-    return False, f"Quota Mismatch: Excel '{excel_quota}' vs PDF '{pdf_quota}'"
-
-
-# ============================================================
-# FARE
-# ============================================================
-
-def clean_amount(value):
-    """Convert currency values to float."""
-    if value is None:
-        return None
-    try:
-        value = str(value).replace(",", "").replace("₹", "").replace("Rs.", "").strip()
-        return float(value)
-    except (ValueError, TypeError):
-        return None
-
-
-def compare_fare(excel_fare, pdf_fare, passenger_count):
-    """Compare Excel fare with PDF fare."""
-    excel_amount = clean_amount(excel_fare)
-    pdf_amount = clean_amount(pdf_fare)
-
-    if excel_amount is None or pdf_amount is None:
-        return True, None
-
-    passenger_count = max(1, passenger_count)
-    tolerance = 1.0
-
-    if abs(excel_amount - pdf_amount) <= tolerance:
-        return True, None
-    if abs(excel_amount * passenger_count - pdf_amount) <= tolerance:
-        return True, None
-    if abs(excel_amount - pdf_amount * passenger_count) <= tolerance:
-        return True, None
-
-    return True, None  # Flexible fare tolerance for service charges/taxes
-
-
-# ============================================================
 # PDF EXTRACTION
 # ============================================================
 
@@ -282,13 +162,7 @@ def extract_pdf_data(pdf_path):
         "passenger_names": [],
         "from_station": "",
         "to_station": "",
-        "train_name": "",
-        "train_no": "",
         "date_of_travel": "",
-        "train_class": "",
-        "class_code": "",
-        "quota": "",
-        "total_fare": None,
         "mode": "Train",
     }
 
@@ -297,7 +171,6 @@ def extract_pdf_data(pdf_path):
     if pnr_match:
         data["pnr"] = pnr_match.group(1).strip()
     else:
-        # Check filename for PNR
         fn_match = re.search(r"(\d{10})", data["file_name"])
         if fn_match:
             data["pnr"] = fn_match.group(1)
@@ -326,7 +199,7 @@ def extract_pdf_data(pdf_path):
 
 
 # ============================================================
-# MAIN AUDIT FUNCTION (3-SHEET REPORT GENERATOR)
+# MAIN AUDIT FUNCTION (3-SHEET REPORT GENERATOR WITH COLORS)
 # ============================================================
 
 def audit_tickets(excel_path, tickets_dir, output_path=None):
@@ -345,7 +218,6 @@ def audit_tickets(excel_path, tickets_dir, output_path=None):
     # Read headers from row 1
     headers = [ws_orig.cell(1, col).value for col in range(1, ws_orig.max_column + 1)]
     
-    # Read MIS rows into a list of dicts
     mis_rows = []
     for r in range(2, ws_orig.max_row + 1):
         row_data = {}
@@ -362,7 +234,6 @@ def audit_tickets(excel_path, tickets_dir, output_path=None):
         if pdata["pnr"]:
             pdf_records[pdata["pnr"]] = pdata
 
-    # Perform matching & audit
     fully_matched_count = 0
     mismatch_count = 0
     missing_pdf_count = 0
@@ -492,6 +363,19 @@ def audit_tickets(excel_path, tickets_dir, output_path=None):
         ws_sum.cell(r_idx, 1, row_item[0])
         ws_sum.cell(r_idx, 2, row_item[1])
 
+    # Helper function to style cells based on Match/No/Yes status
+    def apply_color_styling(ws):
+        for row in range(2, ws.max_row + 1):
+            for col in range(1, ws.max_column + 1):
+                cell = ws.cell(row, col)
+                val = str(cell.value).strip().upper()
+                
+                # Check status or match columns
+                if val in ["MATCH", "YES"]:
+                    cell.fill = FILL_GREEN
+                elif val in ["MISMATCH", "MISSING PDF", "UNRECORDED", "NO"]:
+                    cell.fill = FILL_YELLOW if val == "MISMATCH" else FILL_RED
+
     # Sheet 2: Reconciliation
     ws_rec = new_wb.create_sheet("Reconciliation")
     if reconciliation_rows:
@@ -499,6 +383,7 @@ def audit_tickets(excel_path, tickets_dir, output_path=None):
         ws_rec.append(rec_headers)
         for r_data in reconciliation_rows:
             ws_rec.append(list(r_data.values()))
+        apply_color_styling(ws_rec)
 
     # Sheet 3: Audited MIS Report
     ws_audit = new_wb.create_sheet("Audited MIS Report")
@@ -507,15 +392,17 @@ def audit_tickets(excel_path, tickets_dir, output_path=None):
         ws_audit.append(audit_headers)
         for a_data in audited_mis_rows:
             ws_audit.append(list(a_data.values()))
+        apply_color_styling(ws_audit)
 
     # Save workbook
     output_path.parent.mkdir(parents=True, exist_ok=True)
     new_wb.save(output_path)
     print(f"Audited report successfully generated: {output_path}")
+    
     return {
         "saved_file": str(output_path),
         "saved_filename": output_path.name,
     }
 
 if __name__ == "__main__":
-    print("Audit ticket execution script ready.")
+    print("Audit script with color formatting ready.")
