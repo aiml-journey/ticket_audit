@@ -1,49 +1,166 @@
-import os
-from flask import Flask, request, send_file, render_template
-from pathlib import Path
-from audit_tickets import audit_tickets
+document.getElementById("auditForm").addEventListener(
+    "submit",
+    async (e) => {
 
-app = Flask(__name__)
+        e.preventDefault();
 
-UPLOAD_FOLDER = Path("uploads")
-UPLOAD_FOLDER.mkdir(exist_ok=True)
+        const btn =
+            document.getElementById("submitBtn");
 
-@app.route("/")
-def index():
-    return render_template("index.html")
+        const misFile =
+            document.getElementById("misFile").files[0];
 
-@app.route("/api/audit", methods=["POST"])
-def audit_api():
-    if "mis_file" not in request.files:
-        return {"error": "No MIS file uploaded"}, 400
-    
-    mis_file = request.files["mis_file"]
-    pdf_files = request.files.getlist("pdf_files")
+        const pdfFiles =
+            document.getElementById("pdfFiles").files;
 
-    session_dir = UPLOAD_FOLDER / "current_session"
-    tickets_dir = session_dir / "testticket"
-    tickets_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save MIS file
-    mis_path = session_dir / mis_file.filename
-    mis_file.save(str(mis_path))
+        if (!misFile) {
+            alert("Please select the MIS Excel file.");
+            return;
+        }
 
-    # Save PDFs
-    for pdf in pdf_files:
-        pdf_path = tickets_dir / pdf.filename
-        pdf.save(str(pdf_path))
+        if (pdfFiles.length === 0) {
+            alert("Please select at least one PDF ticket.");
+            return;
+        }
 
-    # Output path
-    output_path = session_dir / f"Audited_{mis_file.filename}"
 
-    # Run your audit engine
-    result = audit_tickets(
-        excel_path=str(mis_path),
-        tickets_dir=str(tickets_dir),
-        output_path=str(output_path)
-    )
+        btn.textContent =
+            "Auditing tickets...";
 
-    return send_file(result["saved_file"], as_attachment=True)
+        btn.disabled = true;
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+
+        const formData =
+            new FormData();
+
+        formData.append(
+            "mis_file",
+            misFile
+        );
+
+
+        for (
+            const file of pdfFiles
+        ) {
+
+            formData.append(
+                "pdf_files",
+                file
+            );
+
+        }
+
+
+        try {
+
+            const response =
+                await fetch(
+                    "/api/audit",
+                    {
+                        method: "POST",
+                        body: formData
+                    }
+                );
+
+
+            if (!response.ok) {
+
+                let message =
+                    "Audit failed.";
+
+                try {
+
+                    const error =
+                        await response.json();
+
+                    message =
+                        error.details ||
+                        error.error ||
+                        message;
+
+                } catch (_) {}
+
+                throw new Error(
+                    message
+                );
+            }
+
+
+            const blob =
+                await response.blob();
+
+
+            if (
+                !blob ||
+                blob.size === 0
+            ) {
+
+                throw new Error(
+                    "The server returned an empty Excel file."
+                );
+
+            }
+
+
+            const url =
+                window.URL.createObjectURL(
+                    blob
+                );
+
+
+            const link =
+                document.createElement("a");
+
+            link.href = url;
+
+            link.download =
+                "Audited_" +
+                misFile.name;
+
+
+            document.body.appendChild(
+                link
+            );
+
+            link.click();
+
+            link.remove();
+
+
+            setTimeout(() => {
+
+                window.URL.revokeObjectURL(
+                    url
+                );
+
+            }, 1000);
+
+
+            btn.textContent =
+                "Audit Complete ✓";
+
+
+        } catch (error) {
+
+            console.error(
+                error
+            );
+
+            alert(
+                "Audit failed:\n\n" +
+                error.message
+            );
+
+            btn.textContent =
+                "Run Audit & Download Updated Excel Sheet";
+
+
+        } finally {
+
+            btn.disabled = false;
+
+        }
+
+    }
+);
