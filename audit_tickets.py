@@ -512,7 +512,10 @@ def audit_tickets(excel_path, tickets_dir, output_path=None):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     new_wb.save(output_path)
     print(f"Audited report successfully generated: {output_path}")
-    return {"saved_file": str(output_path)}
+    return {
+        "saved_file": str(output_path),
+        "saved_filename": output_path.name,
+    }
 
 if __name__ == "__main__":
     print("Audit ticket execution script ready.")
