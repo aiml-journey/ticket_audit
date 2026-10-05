@@ -1,166 +1,178 @@
-document.getElementById("auditForm").addEventListener(
-    "submit",
-    async (e) => {
+import os
+import uuid
+import shutil
+from pathlib import Path
 
-        e.preventDefault();
+from flask import Flask, request, send_file, jsonify
+from werkzeug.utils import secure_filename
 
-        const btn =
-            document.getElementById("submitBtn");
-
-        const misFile =
-            document.getElementById("misFile").files[0];
-
-        const pdfFiles =
-            document.getElementById("pdfFiles").files;
+from audit_tickets import audit_tickets
 
 
-        if (!misFile) {
-            alert("Please select the MIS Excel file.");
-            return;
-        }
+app = Flask(__name__)
 
-        if (pdfFiles.length === 0) {
-            alert("Please select at least one PDF ticket.");
-            return;
-        }
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_FOLDER = BASE_DIR / "uploads"
 
+UPLOAD_FOLDER.mkdir(exist_ok=True)
 
-        btn.textContent =
-            "Auditing tickets...";
-
-        btn.disabled = true;
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
 
 
-        const formData =
-            new FormData();
-
-        formData.append(
-            "mis_file",
-            misFile
-        );
+@app.route("/")
+def index():
+    return send_file(BASE_DIR / "index.html")
 
 
-        for (
-            const file of pdfFiles
-        ) {
-
-            formData.append(
-                "pdf_files",
-                file
-            );
-
-        }
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "ok"
+    })
 
 
-        try {
+@app.route("/api/audit", methods=["POST"])
+def audit_api():
 
-            const response =
-                await fetch(
-                    "/api/audit",
-                    {
-                        method: "POST",
-                        body: formData
-                    }
-                );
+    if "mis_file" not in request.files:
+        return jsonify({
+            "error": "No MIS Excel file uploaded"
+        }), 400
 
+    mis_file = request.files["mis_file"]
 
-            if (!response.ok) {
+    if not mis_file.filename:
+        return jsonify({
+            "error": "MIS file has no filename"
+        }), 400
 
-                let message =
-                    "Audit failed.";
+    pdf_files = request.files.getlist("pdf_files")
 
-                try {
+    if not pdf_files:
+        return jsonify({
+            "error": "No PDF tickets uploaded"
+        }), 400
 
-                    const error =
-                        await response.json();
+    # Create unique session
+    session_id = uuid.uuid4().hex
 
-                    message =
-                        error.details ||
-                        error.error ||
-                        message;
+    session_dir = UPLOAD_FOLDER / session_id
+    tickets_dir = session_dir / "tickets"
 
-                } catch (_) {}
+    tickets_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
-                throw new Error(
-                    message
-                );
-            }
+    try:
 
+        # -----------------------------
+        # SAVE MIS
+        # -----------------------------
 
-            const blob =
-                await response.blob();
+        mis_filename = secure_filename(
+            mis_file.filename
+        )
 
+        if not mis_filename.lower().endswith(".xlsx"):
+            return jsonify({
+                "error": "MIS file must be an .xlsx file"
+            }), 400
 
-            if (
-                !blob ||
-                blob.size === 0
-            ) {
+        mis_path = session_dir / mis_filename
 
-                throw new Error(
-                    "The server returned an empty Excel file."
-                );
-
-            }
-
-
-            const url =
-                window.URL.createObjectURL(
-                    blob
-                );
+        mis_file.save(
+            str(mis_path)
+        )
 
 
-            const link =
-                document.createElement("a");
+        # -----------------------------
+        # SAVE PDF TICKETS
+        # -----------------------------
 
-            link.href = url;
+        pdf_count = 0
 
-            link.download =
-                "Audited_" +
-                misFile.name;
+        for pdf in pdf_files:
 
+            if not pdf.filename:
+                continue
 
-            document.body.appendChild(
-                link
-            );
+            pdf_filename = secure_filename(
+                pdf.filename
+            )
 
-            link.click();
+            if not pdf_filename.lower().endswith(".pdf"):
+                continue
 
-            link.remove();
+            pdf_path = tickets_dir / pdf_filename
 
+            pdf.save(
+                str(pdf_path)
+            )
 
-            setTimeout(() => {
-
-                window.URL.revokeObjectURL(
-                    url
-                );
-
-            }, 1000);
-
-
-            btn.textContent =
-                "Audit Complete ✓";
+            pdf_count += 1
 
 
-        } catch (error) {
-
-            console.error(
-                error
-            );
-
-            alert(
-                "Audit failed:\n\n" +
-                error.message
-            );
-
-            btn.textContent =
-                "Run Audit & Download Updated Excel Sheet";
+        if pdf_count == 0:
+            return jsonify({
+                "error": "No valid PDF files uploaded"
+            }), 400
 
 
-        } finally {
+        # -----------------------------
+        # OUTPUT FILE
+        # -----------------------------
 
-            btn.disabled = false;
+        output_path = (
+            session_dir
+            / f"Audited_{mis_filename}"
+        )
 
-        }
 
-    }
-);
+        # -----------------------------
+        # RUN AUDIT
+        # -----------------------------
+
+        result = audit_tickets(
+            excel_path=str(mis_path),
+            tickets_dir=str(tickets_dir),
+            output_path=str(output_path)
+        )
+
+
+        # -----------------------------
+        # SEND EXCEL TO BROWSER
+        # -----------------------------
+
+        return send_file(
+            result["saved_file"],
+            as_attachment=True,
+            download_name=result["saved_filename"],
+            mimetype=(
+                "application/vnd.openxmlformats-"
+                "officedocument.spreadsheetml.sheet"
+            )
+        )
+
+
+    except Exception as e:
+
+        return jsonify({
+            "error": "Audit failed",
+            "details": str(e)
+        }), 500
+
+
+if __name__ == "__main__":
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            5000
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
