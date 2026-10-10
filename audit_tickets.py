@@ -16,20 +16,311 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from pypdf import PdfReader
 
-from audit_rules import (
-    names_match_any,
-    classes_match,
-    bus_classes_match,
-    quota_matches,
-    stations_match,
-    dates_match,
-    fare_matches,
-    make_status,
-    yes_no,
-    build_remarks,
-    station_remark,
+
+
+# ============================================================
+# COMPARISON RULES (name, class, quota, station, date, fare, status)
+# ============================================================
+
+# ------------------------------------------------------------
+# Basic normalisation
+# ------------------------------------------------------------
+
+def _up(value):
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value).upper().replace("\n", " ")).strip()
+
+
+# ------------------------------------------------------------
+# PASSENGER NAME
+# ------------------------------------------------------------
+
+HONORIFICS = {"MR", "MRS", "MS", "MISS", "MSTR", "MASTER", "DR", "SHRI", "SMT"}
+
+
+def name_tokens(value):
+    text = re.sub(r"[^A-Z ]", " ", _up(value))
+    return [t for t in text.split() if t not in HONORIFICS]
+
+
+def names_match(mis_name, pdf_name):
+    """
+    PDF tables truncate long names (e.g. 'MAHESHKUMAR SHAR' for
+    'MAHESHKUMAR SHARMA'), so one name may be a prefix of the other.
+    The shorter side must be at least 10 characters to avoid
+    false matches on single first names.
+    """
+    m = " ".join(name_tokens(mis_name))
+    p = " ".join(name_tokens(pdf_name))
+
+    if not m or not p:
+        return False
+
+    if m == p:
+        return True
+
+    shorter, longer = (m, p) if len(m) <= len(p) else (p, m)
+
+    return len(shorter) >= 10 and longer.startswith(shorter)
+
+
+def names_match_any(mis_name, pdf_names):
+    """
+    A single PDF can carry several passengers (e.g. 2 pax on one PNR).
+    Name matches if the MIS passenger is any of them.
+    """
+    return any(names_match(mis_name, n) for n in pdf_names if n)
+
+
+# ------------------------------------------------------------
+# CLASS
+# ------------------------------------------------------------
+
+_PAREN_CODE = re.compile(r"\(([A-Z0-9]{1,3})\)")
+
+
+def class_code(value):
+    """'THIRD AC (3A)' -> '3A', 'CC' -> 'CC', 'AC Sleeper' -> ''"""
+    text = _up(value)
+    m = _PAREN_CODE.search(text)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r"[A-Z0-9]{1,3}", text):
+        return text
+    return ""
+
+
+def bus_classes_match(mis_class, pdf_class):
+    """
+    Bus operators name classes differently ('AC Sleeper' vs
+    'Bharat Benz A/C Sleeper'; 'AIRAVAT CLUB CLASS'). Only the
+    sleeper/seater split is compared; otherwise the row is not penalised.
+    """
+    m, p = _up(mis_class), _up(pdf_class)
+    m_kind = "SLEEPER" if "SLEEPER" in m else "SEATER" if "SEATER" in m else ""
+    p_kind = "SLEEPER" if "SLEEPER" in p else "SEATER" if "SEATER" in p else ""
+    if m_kind and p_kind:
+        return m_kind == p_kind
+    return True
+
+
+def classes_match(mis_class, pdf_class):
+    if not mis_class or not pdf_class:
+        return False
+    if _up(mis_class) == _up(pdf_class):
+        return True
+    a, b = class_code(mis_class), class_code(pdf_class)
+    return bool(a) and a == b
+
+
+# ------------------------------------------------------------
+# QUOTA  (railway only; other modes are always OK)
+# ------------------------------------------------------------
+
+def _canon_quota(value):
+    text = _up(value)
+    if "TATKAL" in text:          # Tatkal and Premium Tatkal are one family
+        return "TATKAL"
+    return text
+
+
+def quota_matches(mis_quota, pdf_quota, railway):
+    if not railway:
+        return True
+    if not mis_quota and not pdf_quota:
+        return True
+    if not mis_quota or not pdf_quota:
+        return False
+    return _canon_quota(mis_quota) == _canon_quota(pdf_quota)
+
+
+# ------------------------------------------------------------
+# STATION (From / To)
+# ------------------------------------------------------------
+
+# MIS sometimes stores a city, PDF stores a station with code.
+# Add a line here whenever a new city/station pair appears.
+CITY_CODE_ALIASES = {
+    "MUMBAI": {"CSMT", "MMCT", "BDTS", "LTT", "BCT"},
+    "NASIK": {"NK"},
+    "NASHIK": {"NK"},
+    "RAIPUR": {"R"},
+    "BHOPAL": {"BPL"},
+    "BANGALORE": {"SBC"},
+    "BENGALURU": {"SBC"},
+    "MADRAS": {"MAS"},
+    "CHENNAI": {"MAS"},
+}
+
+
+# Spelling variants between MIS and PDFs (same place, different name)
+CITY_SYNONYMS = {
+    "BANGALORE": "BENGALURU",
+    "ALAPPUZHA": "ALAPUZHA",
+    "NASIK": "NASHIK",
+}
+
+
+def _station_base(value):
+    text = _up(value)
+    text = re.sub(r"\(.*?\)", " ", text)     # drop (CODE) / (STATE)
+    text = re.sub(r"\bJN\.?\b", " ", text)    # 'RAIPUR JN' -> 'RAIPUR'
+    text = re.sub(r"JN\.?\s*$", "", text.strip())  # 'VADODARAJN' -> 'VADODARA'
+    text = re.sub(r"[^A-Z]", "", text)        # ignore spaces/punctuation
+    return CITY_SYNONYMS.get(text, text)
+
+
+def _station_code(value):
+    m = re.search(r"\(([A-Z]{1,5})\)", _up(value))
+    return m.group(1) if m else ""
+
+
+def stations_match(mis_station, pdf_station):
+    if not mis_station or not pdf_station:
+        return False
+
+    if _up(mis_station) == _up(pdf_station):
+        return True
+
+    mis_base = _station_base(mis_station)
+    pdf_base = _station_base(pdf_station)
+
+    if mis_base and mis_base == pdf_base:
+        return True
+
+    mis_code = _station_code(mis_station)
+    pdf_code = _station_code(pdf_station)
+
+    if mis_code and pdf_code and mis_code == pdf_code:
+        return True
+
+    if pdf_code and mis_base in CITY_CODE_ALIASES:
+        return pdf_code in CITY_CODE_ALIASES[mis_base]
+
+    return False
+
+
+# ------------------------------------------------------------
+# DATE and FARE
+# ------------------------------------------------------------
+
+def dates_match(mis_date_str, pdf_date_str):
+    """Both sides are already dd-mm-yyyy after normalize_date()."""
+    if not mis_date_str or not pdf_date_str:
+        return False
+    return mis_date_str == pdf_date_str
+
+
+def _amount(value):
+    if value is None:
+        return None
+    text = str(value).replace(",", "").replace("₹", "")
+    m = re.search(r"-?\d+(?:\.\d+)?", text)
+    return round(float(m.group()), 2) if m else None
+
+
+def fare_matches(mis_amount, pdf_amount, pnr_total_mis=None):
+    """
+    A PDF can hold the total for every passenger on the PNR, so the
+    PDF amount may equal this row's amount OR the sum of all MIS rows
+    sharing that PNR.
+    """
+    p = _amount(pdf_amount)
+    m = _amount(mis_amount)
+    if p is None or m is None:
+        return False
+    if abs(p - m) < 0.01:
+        return True
+    if pnr_total_mis is not None and abs(p - pnr_total_mis) < 0.01:
+        return True
+    return False
+
+
+# ------------------------------------------------------------
+# STATUS and REMARKS
+# ------------------------------------------------------------
+
+def make_status(checks):
+    """checks: list of booleans for name, class, quota, date, from, to, fare."""
+    return "MATCH" if all(checks) else "MISMATCH"
+
+
+def yes_no(flag):
+    return "Yes" if flag else "No"
+
+
+def build_remarks(problems):
+    """
+    problems: list of already-formatted strings, in the order
+    Name, Class, Quota, Date, From, To, Fare.
+    Returns '' when there are none (MATCH rows stay blank).
+    """
+    return "; ".join(problems)
+
+
+def station_remark(label, mis_station, pdf_station):
+    """
+    With a code on the Excel side:
+      Destination mismatch: PDF has 'MMCT' (MUMBAI CENTRAL (MMCT)) vs Excel 'BVI' (BORIVALI(BVI))
+    Without:
+      Origin mismatch: PDF has 'ANJAR (AJE)' vs Excel 'VAPI'
+    """
+    mis_code = _station_code(mis_station)
+    if mis_code:
+        pdf_code = _station_code(pdf_station) or pdf_station
+        return (
+            f"{label} mismatch: PDF has '{pdf_code}' ({pdf_station}) "
+            f"vs Excel '{mis_code}' ({mis_station})"
+        )
+    return f"{label} mismatch: PDF has '{pdf_station}' vs Excel '{mis_station}'"
+
+
+# ============================================================
+# IRCTC ELECTRONIC RESERVATION SLIP PARSER
+# ============================================================
+
+CLASS_NAMES = (
+    r"FIRST AC|SECOND AC|THIRD AC|AC 2 TIER|AC 3 TIER ECONOMY|SECOND SITTING|"
+    r"CHAIR CAR|AC CHAIR CAR|EXECUTIVE CLASS|SLEEPER|FIRST CLASS|THIRD ECONOMY|AC FIRST CLASS"
 )
-from irctc_ers import extract_irctc_ers
+
+def _clean(text):
+    # IRCTC PDFs use non-breaking and unicode hyphens/spaces
+    for ch in "\u2010\u2011\u2012\u2013\u2212":
+        text = text.replace(ch, "-")
+    return text.replace("\xa0", " ")
+
+def extract_irctc_ers(text):
+    t = _clean(text)
+    out = {"pnr": "", "passenger": "", "passengers": [], "class": "",
+           "quota": "", "travel_date": "", "from": "", "to": "", "fare": ""}
+
+    m = re.search(r"PNR\s+Train No\./Name\s+Class\s*\n\s*(\d{10})", t)
+    if m: out["pnr"] = m.group(1)
+
+    m = re.search(r"(" + CLASS_NAMES + r")\s*\(([A-Z0-9]{1,3})\)", t)
+    if m: out["class"] = f"{m.group(1)} ({m.group(2)})"
+
+    m = re.search(r"\b(General|Tatkal|Premium Tatkal|Ladies|Senior Citizen)\s*\(([A-Z]{2})\)", t)
+    if m: out["quota"] = m.group(1)
+
+    m = re.search(r"Departure\*?\s*\d{1,2}:\d{2}\s+(\d{1,2}-[A-Za-z]{3}-\d{4})", t)
+    if m: out["travel_date"] = m.group(1)
+
+    m = re.search(r"\bTo\n(.+?\))\s+(.+?\))\n", t)
+    if m:
+        out["from"], out["to"] = m.group(1).strip(), m.group(2).strip()
+
+    pax = re.findall(r"^\d+\s+(.+?)\s+\d{1,3}\s+(?:Male|Female|Transgender)\b", t, re.M)
+    out["passengers"] = list(dict.fromkeys(p.strip() for p in pax))
+    out["passenger"] = out["passengers"][0] if out["passengers"] else ""
+
+    block = re.search(r"Payment Details(.*?)PG Charges as applicable", t, re.S)
+    if block:
+        amounts = re.findall(r"₹\s*([\d,]+\.\d{2})", block.group(1))
+        if amounts: out["fare"] = amounts[-1]
+    return out
 
 
 # ============================================================
@@ -458,9 +749,11 @@ def audit_tickets(excel_path, tickets_dir, output_path,
             counts["MISSING PDF"] += 1
             remarks = f"PDF ticket not found in {folder_label} folder"
 
+            pdf_fields = {}
             pdf_file = ""
             p_pax, p_class, p_quota = "", "", ""
             p_date, p_from, p_to, p_fare = "", "", "", None
+            name_ok = class_ok = quota_ok = date_ok = from_ok = to_ok = fare_ok = False
 
         else:
             used_pdfs.add(pdf["path"])
@@ -507,9 +800,6 @@ def audit_tickets(excel_path, tickets_dir, output_path,
             remarks = build_remarks(problems)
 
         # Yes/No for each comparison (Missing PDF rows are all "No")
-        if pdf is None:
-            name_ok = class_ok = quota_ok = date_ok = from_ok = to_ok = fare_ok = False
-
         name_m, class_m, quota_m = yes_no(name_ok), yes_no(class_ok), yes_no(quota_ok)
         date_m, from_m, to_m, fare_m = yes_no(date_ok), yes_no(from_ok), yes_no(to_ok), yes_no(fare_ok)
 
