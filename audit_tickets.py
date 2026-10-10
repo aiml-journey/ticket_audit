@@ -155,6 +155,7 @@ CITY_CODE_ALIASES = {
 
 # Spelling variants between MIS and PDFs (same place, different name)
 CITY_SYNONYMS = {
+    "MANGALORE": "MANGALURU",
     "BANGALORE": "BENGALURU",
     "ALAPPUZHA": "ALAPUZHA",
     "NASIK": "NASHIK",
@@ -407,6 +408,111 @@ def extract_irctc_ers(text):
 
 
 # ============================================================
+# AbhiBus (bus) and Cleartrip / OutOfOffice (flight) readers
+# ============================================================
+
+ABHIBUS_HINT = re.compile(r"abhibus", re.I)
+CLEARTRIP_HINT = re.compile(r"cleartrip|Traveller Details|Onward Sectors|Cabin Class:", re.I)
+
+# Bus stations seen on tickets -> city name used for comparison
+BUS_STATION_CITY = {
+    "MANGALURU BUS STATION": "MANGALURU",
+    "KEMPEGOWDA BS MAJESTIC": "BENGALURU",
+}
+
+# Airport codes -> display name (used in the PDF column)
+AIRPORT_NAMES = {
+    "BOM": "Chhatrapati Shivaji International Airport",
+    "HYD": "Rajiv Gandhi International Airport",
+    "IXR": "Birsa Munda Airport",
+    "DEL": "Indira Gandhi International Airport",
+    "BLR": "Kempegowda International Airport",
+    "MAA": "Chennai International Airport",
+}
+
+
+def _normalize_ws(text):
+    return re.sub(r"[ \t\xa0]+", " ", text.replace("\xa0", " "))
+
+
+def extract_abhibus(text):
+    t = _normalize_ws(text)
+    out = {"pnr": "", "passenger": "", "passengers": [], "class": "", "quota": "",
+           "travel_date": "", "from": "", "to": "", "fare": ""}
+
+    m = re.search(r"Booking Id\s*\n\s*([A-Z0-9]{6,})", t)
+    if m:
+        out["pnr"] = m.group(1)
+
+    m = re.search(r"Bus Type\s*\n\s*(.+?)\s*\n", t)
+    if m:
+        out["class"] = m.group(1).strip()
+
+    # Traveller table: header row, then one row per traveller, ending before "Your Booking"
+    m = re.search(r"Traveller Name Gender Age Seat No\. Status\s*\n(.*?)(?:Your Booking|$)", t, re.S)
+    if m:
+        pax = re.findall(r"^\s*(.+?)\s+(?:Male|Female|Transgender)\s+\d{1,3}\b", m.group(1), re.M)
+        out["passengers"] = list(dict.fromkeys(p.strip() for p in pax))
+        out["passenger"] = out["passengers"][0] if out["passengers"] else ""
+
+    # Departure and arrival: "04 Oct 2026, 09:00 / MANGALURU BUS STATION / 04 Oct 2026, 17:00 / KEMPEGOWDA BS MAJESTIC"
+    m = re.search(
+        r"(\d{2} [A-Za-z]{3} \d{4}), \d{2}:\d{2}\s*\n(.+?)\s*\n\d{2} [A-Za-z]{3} \d{4}, \d{2}:\d{2}\s*\n(.+?)\s*\n",
+        t,
+    )
+    if m:
+        try:
+            out["travel_date"] = datetime.strptime(m.group(1), "%d %b %Y").strftime("%d-%m-%Y")
+        except ValueError:
+            pass
+        out["from"] = BUS_STATION_CITY.get(m.group(2).strip().upper(), m.group(2).strip())
+        out["to"] = BUS_STATION_CITY.get(m.group(3).strip().upper(), m.group(3).strip())
+
+    m = re.search(r"Paid Amount\s*₹\s*([\d,]+\.\d{2})", t)
+    if m:
+        out["fare"] = m.group(1)
+    return out
+
+
+def extract_cleartrip(text):
+    t = _normalize_ws(text)
+    out = {"pnr": "", "passenger": "", "passengers": [], "class": "", "quota": "",
+           "travel_date": "", "from": "", "to": "", "fare": ""}
+
+    # Traveller row: "Nishantsingh Rathod ADT (M) Z9SHNC Z9SHNC 11C | VCSW -"
+    m = re.search(r"([A-Za-z][A-Za-z .']+?)\s+(?:ADT|CHD|INF)\s*\((?:M|F)\)\s+([A-Z0-9]{5,10})\s+[A-Z0-9]{5,10}", t)
+    if m:
+        out["passenger"] = m.group(1).strip()
+        out["passengers"] = [out["passenger"]]
+        out["pnr"] = m.group(2)
+
+    m = re.search(r"Cabin Class:\s*([A-Za-z ]+?)\s*\|", t)
+    if m:
+        out["class"] = m.group(1).strip().title()
+
+    # Onward journey only: from the first sector's origin to the last sector's destination
+    onward = t.split("Return Sectors")[0]
+    codes = re.findall(r"([A-Z]{3})\s*\(Terminal", onward)
+    if codes:
+        out["from"] = f"{AIRPORT_NAMES.get(codes[0], codes[0])} ({codes[0]})"
+        out["to"] = f"{AIRPORT_NAMES.get(codes[-1], codes[-1])} ({codes[-1]})"
+
+    # First departure: "19 Nov 07:20 AM" with the year taken from "Booking Date: 26-Sep-2026"
+    m = re.search(r"(\d{2} [A-Za-z]{3}) \d{2}:\d{2}\s*(?:AM|PM)", onward)
+    year = re.search(r"Booking Date:\s*\d{2}-[A-Za-z]{3}-(\d{4})", t)
+    if m and year:
+        try:
+            out["travel_date"] = datetime.strptime(f"{m.group(1)} {year.group(1)}", "%d %b %Y").strftime("%d-%m-%Y")
+        except ValueError:
+            pass
+
+    m = re.search(r"Total Fare.*?INR\s*([\d,]+(?:\.\d+)?)", t, re.S)
+    if m:
+        out["fare"] = m.group(1)
+    return out
+
+
+# ============================================================
 # OUTPUT STRUCTURE
 # ============================================================
 
@@ -637,6 +743,7 @@ def extract_pnr(text):
 
 
 CLASS_CODES = ["1A", "2A", "3A", "SL", "CC", "EC", "2S", "3E", "FC"]
+QUOTA_WORDS = ["PREMIUM TATKAL", "TATKAL", "GENERAL", "LADIES", "SENIOR CITIZEN"]
 
 
 def extract_generic_fields(text):
@@ -687,6 +794,16 @@ def extract_generic_fields(text):
 def extract_pdf_fields(pdf_path, text=None):
     if text is None:
         text = extract_pdf_text(pdf_path)
+
+    if ABHIBUS_HINT.search(text):
+        fields = extract_abhibus(text)
+        fields["mode"] = "Bus"
+        return fields
+
+    if CLEARTRIP_HINT.search(text):
+        fields = extract_cleartrip(text)
+        fields["mode"] = "Flight"
+        return fields
 
     generic = extract_generic_fields(text)
 
@@ -745,14 +862,14 @@ def build_pdf_index(tickets_dir, mis_pnrs):
         fields = extract_pdf_fields(path, text)
         file_name = os.path.basename(path)
 
-        # Candidate PNRs from the filename and from the IRCTC slip itself
+        # Candidate PNRs from the filename and from the slip itself
         hints = []
         m = FILENAME_PNR.match(file_name)
         if m:
             hints.append(normalize_text(m.group(1)))
-        irctc_pnr = normalize_text(fields.get("pnr", "")) if fields.get("mode") == "Train" else ""
-        if irctc_pnr:
-            hints.append(irctc_pnr)
+        slip_pnr = normalize_text(fields.get("pnr", "")) if fields.get("mode") in ("Train", "Bus", "Flight") else ""
+        if slip_pnr:
+            hints.append(slip_pnr)
 
         entry = {"file": file_name, "path": path, "fields": fields}
 
