@@ -276,6 +276,86 @@ def station_remark(label, mis_station, pdf_station):
 
 
 # ============================================================
+# PASSENGER NAME READING (train and generic tickets)
+# ============================================================
+
+PAX_BLOCK_END = re.compile(r"Acronyms|Transaction Id|Payment Details|Boarding From", re.I)
+NOT_A_NAME = {"DETAILS", "NAME", "AGE", "GENDER", "PASSENGER", "STATUS", "BOOKING STATUS",
+              "CURRENT STATUS", "CATERING SERVICE OPTION", "VEG", "NON VEG"}
+
+
+def looks_like_name(value):
+    v = re.sub(r"\s+", " ", (value or "").strip())
+    if not re.fullmatch(r"[A-Za-z][A-Za-z .'\-]{2,60}", v):
+        return False
+    return v.upper() not in NOT_A_NAME and not re.search(r"\b(CNF|WL|RAC|GNWL)\b", v.upper())
+
+
+def extract_irctc_passengers(text):
+    """Reads the 'Passenger Details' table; works with or without age/gender on the row."""
+    # The table row can appear before or after the heading in the extracted text,
+    # so start at the table header if present, otherwise scan the whole text.
+    text = text.replace("\xa0", " ")
+    header = re.search(r"#\s*Name\s+Age|Passenger Details", text, re.I)
+    block = text[header.end():] if header else text
+    end = PAX_BLOCK_END.search(block)
+    if end:
+        block = block[:end.start()]
+
+    names = []
+    for line in block.splitlines():
+        m = re.match(
+            r"^\s*\d+\s+([A-Za-z][A-Za-z .'\-]*?)"
+            r"(?=\s+\d{1,3}\b|\s+(?:Male|Female|Transgender|M|F)\b|\s{2,}|$)",
+            line,
+        )
+        if m and looks_like_name(m.group(1)):
+            names.append(re.sub(r"\s+", " ", m.group(1)).strip())
+    return list(dict.fromkeys(names))
+
+
+def generic_passenger(text):
+    """Only accepts an explicit 'Passenger Name' label with a real name after it."""
+    m = re.search(r"Passenger Name\s*[:\-|]?\s*([A-Za-z][A-Za-z .'\-]{2,60})", text, re.I)
+    if m and looks_like_name(m.group(1)):
+        return m.group(1).strip()
+    return ""
+
+
+# ============================================================
+# QUOTA READING (train tickets; Tatkal, Premium Tatkal, General, ...)
+# ============================================================
+
+# Longest names first so "Premium Tatkal" wins over "Tatkal"
+QUOTA_NAMES = [
+    "Premium Tatkal", "Tatkal", "General", "Ladies", "Senior Citizen",
+    "Lower Berth", "Divyangjan", "Duty Pass", "Foreign Tourist",
+    "Person With Disability", "Defence Quota", "Yuva", "Sr Citizen",
+]
+
+
+def extract_quota(text):
+    """
+    Reads the quota from the slip header, e.g.
+      'Quota  Distance  Ticket Printing Time'
+      'General (GN) 136 KM ...'      or   'Tatkal (TQ) ...'
+    Only the text just after the 'Quota' heading is searched, so
+    instructions and other slip text cannot be picked up by mistake.
+    Returns the name without the code, e.g. 'Tatkal'.
+    """
+    t = text.replace("\xa0", " ")
+    heading = re.search(r"\bQuota\b", t, re.I)
+    window = t[heading.end(): heading.end() + 250] if heading else t
+
+    best = None
+    for name in QUOTA_NAMES:
+        m = re.search(r"(?<![A-Za-z])" + re.escape(name) + r"(?![A-Za-z])", window, re.I)
+        if m and (best is None or m.start() < best[0]):
+            best = (m.start(), name)
+    return best[1] if best else ""
+
+
+# ============================================================
 # IRCTC ELECTRONIC RESERVATION SLIP PARSER
 # ============================================================
 
@@ -305,9 +385,7 @@ def extract_irctc_ers(text):
     if m:
         out["class"] = f"{m.group(1)} ({m.group(2)})"
 
-    m = re.search(r"\b(General|Tatkal|Premium Tatkal|Ladies|Senior Citizen)\s*\(([A-Z]{2})\)", t)
-    if m:
-        out["quota"] = m.group(1)
+    out["quota"] = extract_quota(t)
 
     m = re.search(r"Departure\*?\s*\d{1,2}:\d{2}\s+(\d{1,2}-[A-Za-z]{3}-\d{4})", t)
     if m:
@@ -317,8 +395,7 @@ def extract_irctc_ers(text):
     if m:
         out["from"], out["to"] = m.group(1).strip(), m.group(2).strip()
 
-    pax = re.findall(r"^\d+\s+(.+?)\s+\d{1,3}\s+(?:Male|Female|Transgender)\b", t, re.M)
-    out["passengers"] = list(dict.fromkeys(p.strip() for p in pax))
+    out["passengers"] = extract_irctc_passengers(t)
     out["passenger"] = out["passengers"][0] if out["passengers"] else ""
 
     block = re.search(r"Payment Details(.*?)PG Charges as applicable", t, re.S)
@@ -560,13 +637,12 @@ def extract_pnr(text):
 
 
 CLASS_CODES = ["1A", "2A", "3A", "SL", "CC", "EC", "2S", "3E", "FC"]
-QUOTA_WORDS = ["PREMIUM TATKAL", "TATKAL", "GENERAL", "LADIES", "SENIOR CITIZEN"]
 
 
 def extract_generic_fields(text):
     upper = normalize_text(text)
 
-    passenger = clean_field(extract_after_label(text, ["Passenger Name", "Passenger"]))
+    passenger = generic_passenger(text)
 
     travel_class = clean_field(extract_after_label(text, ["Class", "Travel Class"]))
     if not travel_class:
@@ -575,12 +651,7 @@ def extract_generic_fields(text):
                 travel_class = code
                 break
 
-    quota = clean_field(extract_after_label(text, ["Quota"]))
-    if not quota:
-        for word in QUOTA_WORDS:
-            if re.search(r"\b" + word + r"\b", upper):
-                quota = word.title()
-                break
+    quota = extract_quota(text)
 
     travel_date = clean_field(extract_after_label(
         text, ["Date Of Travel", "Date of Travel", "Travel Date", "Journey Date", "Date of Journey"]))
@@ -797,6 +868,7 @@ def audit_tickets(excel_path, tickets_dir, output_path,
             counts["MISSING PDF"] += 1
             remarks = f"PDF ticket not found in {folder_label} folder"
 
+            pdf_fields = {}
             pdf_file = ""
             p_pax, p_class, p_quota = "", "", ""
             p_date, p_from, p_to, p_fare = "", "", "", None
