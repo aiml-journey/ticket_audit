@@ -17,7 +17,6 @@ from openpyxl.utils import get_column_letter
 from pypdf import PdfReader
 
 
-
 # ============================================================
 # COMPARISON RULES (name, class, quota, station, date, fare, status)
 # ============================================================
@@ -285,11 +284,13 @@ CLASS_NAMES = (
     r"CHAIR CAR|AC CHAIR CAR|EXECUTIVE CLASS|SLEEPER|FIRST CLASS|THIRD ECONOMY|AC FIRST CLASS"
 )
 
+
 def _clean(text):
     # IRCTC PDFs use non-breaking and unicode hyphens/spaces
     for ch in "\u2010\u2011\u2012\u2013\u2212":
         text = text.replace(ch, "-")
     return text.replace("\xa0", " ")
+
 
 def extract_irctc_ers(text):
     t = _clean(text)
@@ -297,16 +298,20 @@ def extract_irctc_ers(text):
            "quota": "", "travel_date": "", "from": "", "to": "", "fare": ""}
 
     m = re.search(r"PNR\s+Train No\./Name\s+Class\s*\n\s*(\d{10})", t)
-    if m: out["pnr"] = m.group(1)
+    if m:
+        out["pnr"] = m.group(1)
 
     m = re.search(r"(" + CLASS_NAMES + r")\s*\(([A-Z0-9]{1,3})\)", t)
-    if m: out["class"] = f"{m.group(1)} ({m.group(2)})"
+    if m:
+        out["class"] = f"{m.group(1)} ({m.group(2)})"
 
     m = re.search(r"\b(General|Tatkal|Premium Tatkal|Ladies|Senior Citizen)\s*\(([A-Z]{2})\)", t)
-    if m: out["quota"] = m.group(1)
+    if m:
+        out["quota"] = m.group(1)
 
     m = re.search(r"Departure\*?\s*\d{1,2}:\d{2}\s+(\d{1,2}-[A-Za-z]{3}-\d{4})", t)
-    if m: out["travel_date"] = m.group(1)
+    if m:
+        out["travel_date"] = m.group(1)
 
     m = re.search(r"\bTo\n(.+?\))\s+(.+?\))\n", t)
     if m:
@@ -319,7 +324,8 @@ def extract_irctc_ers(text):
     block = re.search(r"Payment Details(.*?)PG Charges as applicable", t, re.S)
     if block:
         amounts = re.findall(r"₹\s*([\d,]+\.\d{2})", block.group(1))
-        if amounts: out["fare"] = amounts[-1]
+        if amounts:
+            out["fare"] = amounts[-1]
     return out
 
 
@@ -607,46 +613,89 @@ def extract_generic_fields(text):
     }
 
 
-def extract_pdf_fields(pdf_path):
-    text = extract_pdf_text(pdf_path)
+def extract_pdf_fields(pdf_path, text=None):
+    if text is None:
+        text = extract_pdf_text(pdf_path)
 
-    if re.search(r"Electronic Reservation Slip|IRCTC", text, re.IGNORECASE):
+    generic = extract_generic_fields(text)
+
+    if IRCTC_HINT.search(text):
         fields = extract_irctc_ers(text)
         fields["mode"] = "Train"
+        # If the slip layout was not understood, fall back to the generic reader
+        if not fields.get("passenger"):
+            fields["passenger"] = generic["passenger"]
+            fields["passengers"] = generic["passengers"]
+        for key in ("class", "quota", "travel_date", "from", "to", "fare"):
+            fields.setdefault(key, "")
+            if not fields[key]:
+                fields[key] = generic.get(key, "")
         return fields
 
-    fields = extract_generic_fields(text)
-    fields["mode"] = ""
-    return fields
+    generic["mode"] = ""
+    return generic
 
 
 # ============================================================
 # PDF INDEX
 # ============================================================
 
-def build_pdf_index(tickets_dir):
+FILENAME_PNR = re.compile(r"^\s*([A-Za-z0-9]{5,20})(?=[\s_\-.]|$)")
+IRCTC_HINT = re.compile(r"ELECTRONIC RESERVATION SLIP|IRCTC|BOARDING FROM|TRAIN NO\./NAME", re.I)
+
+
+def whole_token_in(token, text_upper):
+    return re.search(r"(?<![A-Z0-9])" + re.escape(token) + r"(?![A-Z0-9])", text_upper) is not None
+
+
+def build_pdf_index(tickets_dir, mis_pnrs):
     """
+    Links each PDF to a MIS PNR without relying on the generic PNR parser.
+
+    A PDF is linked to a MIS PNR when:
+      1. its filename starts with that PNR (e.g. "8654234382-AJE-VAPI.pdf"), or
+      2. the IRCTC slip's own PNR equals it, or
+      3. the PNR appears as a whole token anywhere in the PDF text.
+
     Returns:
-      index     : {PNR: {"file", "path", "fields"}} for the first PDF of each PNR
-      pdf_files : every PDF found, sorted
-      cache     : {path: fields} so each PDF is parsed once
+      index       : {MIS PNR: {"file", "path", "fields"}}
+      unmatched   : [{"file", "path", "fields", "pnr_hint"}]  PDFs not linked to any MIS PNR
+      pdf_files   : every PDF found, sorted
     """
     pdf_files = sorted(glob.glob(os.path.join(tickets_dir, "**", "*.pdf"), recursive=True))
+    mis_set = set(mis_pnrs)
+    by_length = sorted(mis_set, key=len, reverse=True)
 
-    index, cache = {}, {}
+    index, unmatched = {}, []
+
     for path in pdf_files:
-        fields = extract_pdf_fields(path)
-        cache[path] = fields
+        text = extract_pdf_text(path)
+        text_upper = normalize_text(text)
+        fields = extract_pdf_fields(path, text)
+        file_name = os.path.basename(path)
 
-        pnr = normalize_text(fields.get("pnr", ""))
-        if pnr and pnr not in index:
-            index[pnr] = {
-                "file": os.path.basename(path),
-                "path": path,
-                "fields": fields,
-            }
+        # Candidate PNRs from the filename and from the IRCTC slip itself
+        hints = []
+        m = FILENAME_PNR.match(file_name)
+        if m:
+            hints.append(normalize_text(m.group(1)))
+        irctc_pnr = normalize_text(fields.get("pnr", "")) if fields.get("mode") == "Train" else ""
+        if irctc_pnr:
+            hints.append(irctc_pnr)
 
-    return index, pdf_files, cache
+        entry = {"file": file_name, "path": path, "fields": fields}
+
+        linked = next((h for h in hints if h in mis_set), None)
+        if linked is None:
+            linked = next((p for p in by_length if len(p) >= 6 and whole_token_in(p, text_upper)), None)
+
+        if linked is not None:
+            index.setdefault(linked, entry)
+        else:
+            entry["pnr_hint"] = hints[0] if hints else ""
+            unmatched.append(entry)
+
+    return index, unmatched, pdf_files
 
 
 # ============================================================
@@ -731,14 +780,13 @@ def audit_tickets(excel_path, tickets_dir, output_path,
     # --------------------------------------------------------
     # INDEX PDFs
     # --------------------------------------------------------
-    pdf_index, pdf_files, pdf_cache = build_pdf_index(tickets_dir)
+    pdf_index, unmatched_pdfs, pdf_files = build_pdf_index(tickets_dir, mis_pnrs)
 
     # --------------------------------------------------------
     # RECONCILE EACH MIS ROW
     # --------------------------------------------------------
     recon_rows, audited_rows = [], []
     counts = {"MATCH": 0, "MISMATCH": 0, "MISSING PDF": 0, "UNRECORDED": 0}
-    used_pdfs = set()
 
     for rec in records:
         railway = is_railway(rec["mode"])
@@ -749,14 +797,12 @@ def audit_tickets(excel_path, tickets_dir, output_path,
             counts["MISSING PDF"] += 1
             remarks = f"PDF ticket not found in {folder_label} folder"
 
-            pdf_fields = {}
             pdf_file = ""
             p_pax, p_class, p_quota = "", "", ""
             p_date, p_from, p_to, p_fare = "", "", "", None
             name_ok = class_ok = quota_ok = date_ok = from_ok = to_ok = fare_ok = False
 
         else:
-            used_pdfs.add(pdf["path"])
             pdf_fields = pdf["fields"]
             pdf_file = pdf["file"]
 
@@ -827,24 +873,22 @@ def audit_tickets(excel_path, tickets_dir, output_path,
         ])
 
     # --------------------------------------------------------
-    # UNRECORDED PDFs (in folder, PNR not in MIS)
+    # UNRECORDED PDFs (in folder, not linked to any MIS row)
     # --------------------------------------------------------
-    for path in pdf_files:
-        if path in used_pdfs:
-            continue
-
-        fields = pdf_cache[path]
-        pnr = normalize_text(fields.get("pnr", ""))
-        if not pnr or pnr in mis_pnrs:
-            continue
-
+    for entry in unmatched_pdfs:
+        fields = entry["fields"]
+        pnr = entry.get("pnr_hint", "")
         counts["UNRECORDED"] += 1
         p_date = normalize_date(fields.get("travel_date", ""))
         p_fare = normalize_number(fields.get("fare", ""))
-        remarks = "Found in PDF folder, missing in Excel MIS report"
+        remarks = (
+            "Found in PDF folder, missing in Excel MIS report"
+            if pnr else
+            "Found in PDF folder, PNR could not be read from file"
+        )
 
         recon_rows.append([
-            "UNRECORDED", pnr, fields.get("mode", ""), "", os.path.basename(path),
+            "UNRECORDED", pnr, fields.get("mode", ""), "", entry["file"],
             "", fields.get("passenger", ""), "No",
             "", fields.get("class", ""), "No",
             "", fields.get("quota", ""), "No",
