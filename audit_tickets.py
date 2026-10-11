@@ -17,6 +17,7 @@ from openpyxl.utils import get_column_letter
 from pypdf import PdfReader
 
 
+
 # ============================================================
 # COMPARISON RULES (name, class, quota, station, date, fare, status)
 # ============================================================
@@ -459,13 +460,11 @@ CLASS_NAMES = (
     r"CHAIR CAR|AC CHAIR CAR|EXECUTIVE CLASS|SLEEPER|FIRST CLASS|THIRD ECONOMY|AC FIRST CLASS"
 )
 
-
 def _clean(text):
     # IRCTC PDFs use non-breaking and unicode hyphens/spaces
     for ch in "\u2010\u2011\u2012\u2013\u2212":
         text = text.replace(ch, "-")
     return text.replace("\xa0", " ")
-
 
 def extract_irctc_ers(text):
     t = _clean(text)
@@ -473,12 +472,10 @@ def extract_irctc_ers(text):
            "quota": "", "travel_date": "", "from": "", "to": "", "fare": ""}
 
     m = re.search(r"PNR\s+Train No\./Name\s+Class\s*\n\s*(\d{10})", t)
-    if m:
-        out["pnr"] = m.group(1)
+    if m: out["pnr"] = m.group(1)
 
     m = re.search(r"(" + CLASS_NAMES + r")\s*\(([A-Z0-9]{1,3})\)", t)
-    if m:
-        out["class"] = f"{m.group(1)} ({m.group(2)})"
+    if m: out["class"] = f"{m.group(1)} ({m.group(2)})"
 
     out["quota"] = extract_quota(t)
 
@@ -501,8 +498,7 @@ def extract_irctc_ers(text):
     block = re.search(r"Payment Details(.*?)PG Charges as applicable", t, re.S)
     if block:
         amounts = re.findall(r"₹\s*([\d,]+\.\d{2})", block.group(1))
-        if amounts:
-            out["fare"] = amounts[-1]
+        if amounts: out["fare"] = amounts[-1]
     return out
 
 
@@ -691,30 +687,43 @@ def normalize_number(value):
     return round(float(match.group()), 2)
 
 
-DATE_FORMATS = [
-    "%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y", "%d-%m-%y", "%d/%m/%y",
-    "%Y-%m-%d", "%Y/%m/%d", "%d %b %Y", "%d %B %Y", "%d-%b-%Y", "%d-%B-%Y",
-]
+MONTHS = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+          "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
 
 
 def normalize_date(value):
-    """Returns dd-mm-yyyy when the value is a date; otherwise the cleaned text."""
+    """
+    Returns dd-mm-yyyy for any common date form, e.g.
+      27-09-2026, 27/09/2026, 27-Sep-2026, 27-Sept-2026, 27 Sep 2026, 2026-09-27
+    Otherwise returns the cleaned text unchanged.
+    """
     if value is None or value == "":
         return ""
     if isinstance(value, datetime):
         return value.strftime("%d-%m-%Y")
-    text = clean(value).split(" ")[0] if clean(value) else ""
-    for fmt in DATE_FORMATS:
+
+    text = _clean(clean(value))
+
+    m = re.search(r"(?<!\d)(\d{1,2})[-/ .]([A-Za-z]{3,9}|\d{1,2})[-/ .](\d{4}|\d{2})(?!\d)", text)
+    if m:
+        day, mon, year = m.group(1), m.group(2), m.group(3)
+        month = int(mon) if mon.isdigit() else MONTHS.get(mon[:3].upper())
+        yr = int(year)
+        if yr < 100:
+            yr += 2000
+        if month:
+            try:
+                return datetime(yr, month, int(day)).strftime("%d-%m-%Y")
+            except ValueError:
+                pass
+
+    m = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b", text)
+    if m:
         try:
-            return datetime.strptime(text, fmt).strftime("%d-%m-%Y")
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).strftime("%d-%m-%Y")
         except ValueError:
             pass
-    # Full-string attempt for values like "27 Sep 2026" (contains spaces)
-    for fmt in DATE_FORMATS:
-        try:
-            return datetime.strptime(clean(value), fmt).strftime("%d-%m-%Y")
-        except ValueError:
-            pass
+
     return clean(value)
 
 
@@ -888,7 +897,23 @@ def extract_generic_fields(text):
     }
 
 
-def extract_pdf_fields(pdf_path, text=None):
+def fix_route(fields):
+    """
+    Makes sure From holds only the origin station and To only the destination,
+    even when a PDF puts the whole route into one of the two fields.
+    """
+    f_parts = STATION_TOKEN.findall(fields.get("from", "") or "")
+    t_parts = STATION_TOKEN.findall(fields.get("to", "") or "")
+
+    if len(f_parts) >= 2:
+        fields["from"] = f"{f_parts[0][0].strip()} ({f_parts[0][1]})"
+        fields["to"] = f"{f_parts[1][0].strip()} ({f_parts[1][1]})"
+    elif len(t_parts) >= 2:
+        fields["to"] = f"{t_parts[-1][0].strip()} ({t_parts[-1][1]})"
+    return fields
+
+
+def _extract_pdf_fields_raw(pdf_path, text=None):
     if text is None:
         text = extract_pdf_text(pdf_path)
 
@@ -919,6 +944,10 @@ def extract_pdf_fields(pdf_path, text=None):
 
     generic["mode"] = ""
     return generic
+
+
+def extract_pdf_fields(pdf_path, text=None):
+    return fix_route(_extract_pdf_fields_raw(pdf_path, text))
 
 
 # ============================================================
@@ -1082,6 +1111,7 @@ def audit_tickets(excel_path, tickets_dir, output_path,
             counts["MISSING PDF"] += 1
             remarks = f"PDF ticket not found in {folder_label} folder"
 
+            pdf_fields = {}
             pdf_file = ""
             p_pax, p_class, p_quota = "", "", ""
             p_date, p_from, p_to, p_fare = "", "", "", None
@@ -1101,18 +1131,15 @@ def audit_tickets(excel_path, tickets_dir, output_path,
 
             pdf_passengers = pdf_fields.get("passengers") or [p_pax]
 
-            # Show the passenger who actually matched (not always the first on the ticket)
             matched_pax = next((n for n in pdf_passengers if n and names_match(rec["passenger"], n)), None)
             name_ok = matched_pax is not None
             if matched_pax:
                 p_pax = matched_pax
             if not name_ok:
-                # Fallback: search the whole PDF text for the passenger's name
                 found = find_name_in_text(rec["passenger"], pdf.get("text", ""))
                 if found:
                     p_pax = found
                     name_ok = True
-
             class_ok = (classes_match if railway else bus_classes_match)(rec["class"], p_class)
             quota_ok = quota_matches(rec["quota"], p_quota, railway)
             date_ok = dates_match(normalize_date(rec["travel_date"]), p_date)
