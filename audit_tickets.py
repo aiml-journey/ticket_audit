@@ -367,6 +367,57 @@ def find_name_in_text(mis_name, text):
 
 
 # ============================================================
+# ROUTE AND DATE READERS (layout-independent)
+# ============================================================
+
+STATION_TOKEN = re.compile(r"([A-Z][A-Za-z .&'\-]{1,40}?)\s*\(([A-Z]{2,5})\)")
+
+
+def split_route(text):
+    """
+    Finds the origin and destination when they appear on one line, e.g.
+      'KHARAGPUR (KGP) RANCHI (RNC)'   ->  ('KHARAGPUR (KGP)', 'RANCHI (RNC)')
+    Returns ('', '') if no line holds two stations.
+    """
+    best = []
+    for line in text.replace("\xa0", " ").splitlines():
+        found = STATION_TOKEN.findall(line)
+        if len(found) >= 2 and len(found) > len(best):
+            best = found
+    if len(best) >= 2:
+        first = f"{best[0][0].strip()} ({best[0][1]})"
+        second = f"{best[1][0].strip()} ({best[1][1]})"
+        return first, second
+    return "", ""
+
+
+DATE_TOKEN = re.compile(r"\b\d{1,2}[-/ ](?:\d{1,2}|[A-Za-z]{3,9})[-/ ]\d{4}\b")
+NOT_TRAVEL_LINE = re.compile(r"Print|Booking|Issued|Generated|Purchase", re.I)
+TRAVEL_LINE = re.compile(r"Depart|Journey|Travel|Boarding|Date", re.I)
+
+
+def find_travel_date(text):
+    """
+    Returns the journey date as dd-mm-yyyy.
+    Prefers a date on a line that mentions travel/departure, and skips
+    lines about printing or booking (those dates are not the journey).
+    """
+    fallback = ""
+    for line in _clean(text).splitlines():
+        m = DATE_TOKEN.search(line)
+        if not m:
+            continue
+        value = normalize_date(m.group())
+        if NOT_TRAVEL_LINE.search(line):
+            continue
+        if TRAVEL_LINE.search(line):
+            return value
+        if not fallback:
+            fallback = value
+    return fallback
+
+
+# ============================================================
 # QUOTA READING (train tickets; Tatkal, Premium Tatkal, General, ...)
 # ============================================================
 
@@ -434,10 +485,15 @@ def extract_irctc_ers(text):
     m = re.search(r"Departure\*?\s*\d{1,2}:\d{2}\s+(\d{1,2}-[A-Za-z]{3}-\d{4})", t)
     if m:
         out["travel_date"] = m.group(1)
+    else:
+        out["travel_date"] = find_travel_date(t)
 
     m = re.search(r"\bTo\n(.+?\))\s+(.+?\))\n", t)
     if m:
         out["from"], out["to"] = m.group(1).strip(), m.group(2).strip()
+
+    if not out["from"] or not out["to"]:
+        out["from"], out["to"] = split_route(t)
 
     out["passengers"] = extract_irctc_passengers(t)
     out["passenger"] = out["passengers"][0] if out["passengers"] else ""
@@ -803,14 +859,12 @@ def extract_generic_fields(text):
 
     quota = extract_quota(text)
 
-    travel_date = clean_field(extract_after_label(
-        text, ["Date Of Travel", "Date of Travel", "Travel Date", "Journey Date", "Date of Journey"]))
-    if not travel_date:
-        m = re.search(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", text)
-        travel_date = m.group() if m else ""
+    travel_date = find_travel_date(text)
 
-    origin = clean_field(extract_after_label(text, ["From", "Origin", "Boarding From", "Source"]))
-    destination = clean_field(extract_after_label(text, ["To", "Destination", "Drop", "Arrival"]))
+    origin, destination = split_route(text)
+    if not origin or not destination:
+        origin = clean_field(extract_after_label(text, ["From", "Origin", "Boarding From", "Source"]))
+        destination = clean_field(extract_after_label(text, ["To", "Destination", "Drop", "Arrival"]))
 
     fare = ""
     for pattern in [
@@ -885,7 +939,7 @@ def build_pdf_index(tickets_dir, mis_pnrs):
 
     A PDF is linked to a MIS PNR when:
       1. its filename starts with that PNR (e.g. "8654234382-AJE-VAPI.pdf"), or
-      2. the IRCTC slip's own PNR equals it, or
+      2. the slip's own PNR equals it (train, bus or flight), or
       3. the PNR appears as a whole token anywhere in the PDF text.
 
     Returns:
@@ -1047,7 +1101,11 @@ def audit_tickets(excel_path, tickets_dir, output_path,
 
             pdf_passengers = pdf_fields.get("passengers") or [p_pax]
 
-            name_ok = names_match_any(rec["passenger"], pdf_passengers)
+            # Show the passenger who actually matched (not always the first on the ticket)
+            matched_pax = next((n for n in pdf_passengers if n and names_match(rec["passenger"], n)), None)
+            name_ok = matched_pax is not None
+            if matched_pax:
+                p_pax = matched_pax
             if not name_ok:
                 # Fallback: search the whole PDF text for the passenger's name
                 found = find_name_in_text(rec["passenger"], pdf.get("text", ""))
