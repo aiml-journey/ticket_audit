@@ -324,6 +324,49 @@ def generic_passenger(text):
 
 
 # ============================================================
+# NAME FINDER (fallback: searches the whole PDF text for the passenger's name)
+# ============================================================
+
+def find_name_in_text(mis_name, text):
+    """
+    Searches the PDF text line by line for the MIS passenger's name.
+    Every name word must be present (a word may be cut short, as PDF tables
+    do, e.g. 'SHAR' for 'SHARMA'). Returns the real text found on the PDF
+    line, from the first to the last matched word, or '' if not found.
+    """
+    tokens = name_tokens(mis_name)
+    if not tokens or (len(tokens) == 1 and len(tokens[0]) < 4):
+        return ""
+
+    for line in text.replace("\xa0", " ").splitlines():
+        words = re.findall(r"[A-Za-z][A-Za-z.']*", line)
+        if not words:
+            continue
+        upper_words = [w.upper() for w in words]
+
+        positions = []
+        for tok in tokens:
+            hit = None
+            for i, w in enumerate(upper_words):
+                if w == tok or (len(w) >= 4 and tok.startswith(w) and len(w) < len(tok)):
+                    hit = i
+                    break
+            if hit is None:
+                positions = []
+                break
+            positions.append(hit)
+
+        if positions:
+            start, end = min(positions), max(positions)
+            found = " ".join(words[start:end + 1]).strip()
+            # keep only real name words (no honorific, no label noise)
+            found = re.sub(r"^(?:Mr|Ms|Mrs|Miss|MR|MS|MRS|MISS)\.?\s+", "", found)
+            if looks_like_name(found):
+                return found
+    return ""
+
+
+# ============================================================
 # QUOTA READING (train tickets; Tatkal, Premium Tatkal, General, ...)
 # ============================================================
 
@@ -846,8 +889,8 @@ def build_pdf_index(tickets_dir, mis_pnrs):
       3. the PNR appears as a whole token anywhere in the PDF text.
 
     Returns:
-      index       : {MIS PNR: {"file", "path", "fields"}}
-      unmatched   : [{"file", "path", "fields", "pnr_hint"}]  PDFs not linked to any MIS PNR
+      index       : {MIS PNR: {"file", "path", "fields", "text"}}
+      unmatched   : [{"file", "path", "fields", "text", "pnr_hint"}]  PDFs not linked to any MIS PNR
       pdf_files   : every PDF found, sorted
     """
     pdf_files = sorted(glob.glob(os.path.join(tickets_dir, "**", "*.pdf"), recursive=True))
@@ -871,7 +914,7 @@ def build_pdf_index(tickets_dir, mis_pnrs):
         if slip_pnr:
             hints.append(slip_pnr)
 
-        entry = {"file": file_name, "path": path, "fields": fields}
+        entry = {"file": file_name, "path": path, "fields": fields, "text": text}
 
         linked = next((h for h in hints if h in mis_set), None)
         if linked is None:
@@ -985,7 +1028,6 @@ def audit_tickets(excel_path, tickets_dir, output_path,
             counts["MISSING PDF"] += 1
             remarks = f"PDF ticket not found in {folder_label} folder"
 
-            pdf_fields = {}
             pdf_file = ""
             p_pax, p_class, p_quota = "", "", ""
             p_date, p_from, p_to, p_fare = "", "", "", None
@@ -1006,6 +1048,13 @@ def audit_tickets(excel_path, tickets_dir, output_path,
             pdf_passengers = pdf_fields.get("passengers") or [p_pax]
 
             name_ok = names_match_any(rec["passenger"], pdf_passengers)
+            if not name_ok:
+                # Fallback: search the whole PDF text for the passenger's name
+                found = find_name_in_text(rec["passenger"], pdf.get("text", ""))
+                if found:
+                    p_pax = found
+                    name_ok = True
+
             class_ok = (classes_match if railway else bus_classes_match)(rec["class"], p_class)
             quota_ok = quota_matches(rec["quota"], p_quota, railway)
             date_ok = dates_match(normalize_date(rec["travel_date"]), p_date)
