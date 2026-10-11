@@ -95,9 +95,11 @@ def bus_classes_match(mis_class, pdf_class):
     """
     Bus operators name classes differently ('AC Sleeper' vs
     'Bharat Benz A/C Sleeper'; 'AIRAVAT CLUB CLASS'). Only the
-    sleeper/seater split is compared; otherwise the row is not penalised.
+    sleeper/seater split is compared. A missing PDF class is never a match.
     """
     m, p = _up(mis_class), _up(pdf_class)
+    if not p:
+        return False
     m_kind = "SLEEPER" if "SLEEPER" in m else "SEATER" if "SEATER" in m else ""
     p_kind = "SLEEPER" if "SLEEPER" in p else "SEATER" if "SEATER" in p else ""
     if m_kind and p_kind:
@@ -508,7 +510,11 @@ def extract_irctc_ers(text):
     m = re.search(r"PNR\s+Train No\./Name\s+Class\s*\n\s*(\d{10})", t)
     if m: out["pnr"] = m.group(1)
 
-    m = re.search(r"(" + CLASS_NAMES + r")\s*\(([A-Z0-9]{1,3})\)", t)
+    header = re.search(r"Train No\./Name\s+Class", t)
+    window = t[header.end(): header.end() + 200] if header else t
+    m = re.search(r"(" + CLASS_NAMES + r")\s*\(([A-Z0-9]{1,3})\)", window)
+    if not m:
+        m = re.search(r"(" + CLASS_NAMES + r")\s*\(([A-Z0-9]{1,3})\)", t)
     if m: out["class"] = f"{m.group(1)} ({m.group(2)})"
 
     out["quota"] = extract_quota(t)
@@ -891,12 +897,30 @@ CLASS_CODES = ["1A", "2A", "3A", "SL", "CC", "EC", "2S", "3E", "FC"]
 QUOTA_WORDS = ["PREMIUM TATKAL", "TATKAL", "GENERAL", "LADIES", "SENIOR CITIZEN"]
 
 
+BUS_CLASS_PATTERN = re.compile(
+    r"((?:Volvo|Bharat Benz|Scania|Mercedes|Eicher|Ashok Leyland|AIRAVAT)[^\n]{0,45}"
+    r"|(?:Non[ -]?A/?C|A/?C)\s*(?:Semi[ -]?)?(?:Sleeper|Seater)[^\n]{0,15}"
+    r"|(?:Non[ -]?A/?C)\s*(?:Sleeper|Seater))",
+    re.I,
+)
+
+
+def extract_bus_class(text):
+    """Bus class as printed on the ticket, e.g. 'Volvo 9600 SLX Multi-Axle', 'Bharat Benz A/C Seater'."""
+    m = BUS_CLASS_PATTERN.search(_clean(text))
+    if not m:
+        return ""
+    return re.sub(r"\s+", " ", m.group(1)).strip().rstrip(".,")
+
+
 def extract_generic_fields(text):
     upper = normalize_text(text)
 
     passenger = generic_passenger(text)
 
     travel_class = clean_field(extract_after_label(text, ["Class", "Travel Class"]))
+    if not travel_class:
+        travel_class = extract_bus_class(text)
     if not travel_class:
         for code in CLASS_CODES:
             if re.search(r"\b" + code + r"\b", upper):
