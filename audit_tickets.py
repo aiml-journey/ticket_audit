@@ -328,42 +328,37 @@ def generic_passenger(text):
 # NAME FINDER (fallback: searches the whole PDF text for the passenger's name)
 # ============================================================
 
+# Words that appear next to names in ticket tables and are never part of a name
+TABLE_LABEL_WORDS = {"MALE", "FEMALE", "TRANSGENDER", "ADT", "CHD", "INF", "CNF", "AGE",
+                     "GENDER", "SEAT", "VEG", "NONVEG", "STATUS", "DETAILS", "PASSENGER"}
+
+
 def find_name_in_text(mis_name, text):
     """
-    Searches the PDF text line by line for the MIS passenger's name.
-    Every name word must be present (a word may be cut short, as PDF tables
-    do, e.g. 'SHAR' for 'SHARMA'). Returns the real text found on the PDF
-    line, from the first to the last matched word, or '' if not found.
+    Searches the PDF text for the MIS passenger's name.
+    PDFs often cut names short (e.g. 'MANISH MADHULKAR' for 'Manish Madhulkar Gade',
+    'MITESH HIRALAL S' for 'MITESH HIRALAL SHAH'). For every line, each run of
+    1 to 5 words that starts like the MIS name is checked with names_match(),
+    which accepts a truncated name. Returns the real text found, or ''.
     """
     tokens = name_tokens(mis_name)
-    if not tokens or (len(tokens) == 1 and len(tokens[0]) < 4):
+    if not tokens:
         return ""
+    first = tokens[0]
 
-    for line in text.replace("\xa0", " ").splitlines():
+    for line in _clean(text).splitlines():
         words = re.findall(r"[A-Za-z][A-Za-z.']*", line)
-        if not words:
-            continue
-        upper_words = [w.upper() for w in words]
-
-        positions = []
-        for tok in tokens:
-            hit = None
-            for i, w in enumerate(upper_words):
-                if w == tok or (len(w) >= 4 and tok.startswith(w) and len(w) < len(tok)):
-                    hit = i
-                    break
-            if hit is None:
-                positions = []
-                break
-            positions.append(hit)
-
-        if positions:
-            start, end = min(positions), max(positions)
-            found = " ".join(words[start:end + 1]).strip()
-            # keep only real name words (no honorific, no label noise)
-            found = re.sub(r"^(?:Mr|Ms|Mrs|Miss|MR|MS|MRS|MISS)\.?\s+", "", found)
-            if looks_like_name(found):
-                return found
+        for i, w in enumerate(words):
+            wu = w.upper()
+            if not (wu == first or (len(wu) >= 3 and first.startswith(wu))):
+                continue
+            for j in range(min(i + 6, len(words)), i, -1):   # longest run first
+                run = words[i:j]
+                if any(x.upper() in TABLE_LABEL_WORDS for x in run):
+                    continue
+                candidate = " ".join(run)
+                if names_match(mis_name, candidate) and looks_like_name(candidate):
+                    return candidate
     return ""
 
 
@@ -393,8 +388,8 @@ def split_route(text):
 
 
 DATE_TOKEN = re.compile(r"\b\d{1,2}[-/ ](?:\d{1,2}|[A-Za-z]{3,9})[-/ ]\d{4}\b")
-NOT_TRAVEL_LINE = re.compile(r"Print|Booking|Issued|Generated|Purchase", re.I)
-TRAVEL_LINE = re.compile(r"Depart|Journey|Travel|Boarding|Date", re.I)
+NOT_TRAVEL_LINE = re.compile(r"Print|Booking|Issue|Issued|Generated|Purchase|Created|Invoice|Payment", re.I)
+TRAVEL_LINE = re.compile(r"Depart|Journey|Travel|Boarding|Onward|Return", re.I)
 
 
 def find_travel_date(text):
@@ -408,9 +403,9 @@ def find_travel_date(text):
         m = DATE_TOKEN.search(line)
         if not m:
             continue
-        value = normalize_date(m.group())
         if NOT_TRAVEL_LINE.search(line):
             continue
+        value = normalize_date(m.group())
         if TRAVEL_LINE.search(line):
             return value
         if not fallback:
