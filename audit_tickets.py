@@ -387,23 +387,62 @@ def split_route(text):
     return "", ""
 
 
+def find_route(text):
+    """
+    Reads origin and destination from the boarding part of the slip.
+    Starts at 'Boarding From', takes the stations in order, and returns the
+    first station as origin and the next DIFFERENT station as destination.
+    Returns ('', '') when that is not possible, so the caller can fall back.
+    """
+    t = _clean(text)
+    m = re.search(r"Boarding From", t, re.I)
+    if not m:
+        return "", ""
+    region = t[m.end(): m.end() + 400]
+    seq = []
+    for name, code in STATION_TOKEN.findall(region):
+        if not seq or seq[-1][1] != code:
+            seq.append((name.strip(), code))
+    if len(seq) < 2:
+        return "", ""
+    origin = seq[0]
+    dest = next((s for s in seq[1:] if s[1] != origin[1]), None)
+    if dest is None:
+        return "", ""
+    return f"{origin[0]} ({origin[1]})", f"{dest[0]} ({dest[1]})"
+
+
 DATE_TOKEN = re.compile(r"\b\d{1,2}[-/ ](?:\d{1,2}|[A-Za-z]{3,9})[-/ ]\d{4}\b")
-NOT_TRAVEL_LINE = re.compile(r"Print|Booking|Issue|Issued|Generated|Purchase|Created|Invoice|Payment", re.I)
+NOT_TRAVEL_LINE = re.compile(r"Print|Booking|Issue|Issued|Generated|Purchase|Created|Invoice|Payment|Arrival", re.I)
 TRAVEL_LINE = re.compile(r"Depart|Journey|Travel|Boarding|Onward|Return", re.I)
+
+
+JOURNEY_DATE_AFTER_KEYWORD = re.compile(
+    r"(?:Depart\w*|Journey(?:\s+Date)?|Travel Date|Date of Travel|Date of Journey)"
+    r"[^A-Za-z]{0,6}(?:\d{1,2}:\d{2}\s*(?:AM|PM)?\s*)?"
+    r"((?<!\d)\d{1,2}[-/ ](?:\d{1,2}|[A-Za-z]{3,9})[-/ ]\d{4}(?!\d))",
+    re.I,
+)
 
 
 def find_travel_date(text):
     """
-    Returns the journey date as dd-mm-yyyy.
-    Prefers a date on a line that mentions travel/departure, and skips
-    lines about printing or booking (those dates are not the journey).
+    Returns the journey (departure) date as dd-mm-yyyy.
+    1. A date that comes right after 'Departure' or 'Journey' is used.
+    2. Otherwise a date on a travel line is used, skipping lines about
+       printing, booking, issue and arrival (arrival can be the next day).
     """
+    t = _clean(text)
+    m = JOURNEY_DATE_AFTER_KEYWORD.search(t)
+    if m:
+        return normalize_date(m.group(1))
+
     fallback = ""
-    for line in _clean(text).splitlines():
+    for line in t.splitlines():
+        if NOT_TRAVEL_LINE.search(line):
+            continue
         m = DATE_TOKEN.search(line)
         if not m:
-            continue
-        if NOT_TRAVEL_LINE.search(line):
             continue
         value = normalize_date(m.group())
         if TRAVEL_LINE.search(line):
@@ -484,7 +523,10 @@ def extract_irctc_ers(text):
     if m:
         out["from"], out["to"] = m.group(1).strip(), m.group(2).strip()
 
-    if not out["from"] or not out["to"]:
+    r_from, r_to = find_route(t)
+    if r_from and r_to:
+        out["from"], out["to"] = r_from, r_to
+    elif not out["from"] or not out["to"]:
         out["from"], out["to"] = split_route(t)
 
     out["passengers"] = extract_irctc_passengers(t)
@@ -865,7 +907,9 @@ def extract_generic_fields(text):
 
     travel_date = find_travel_date(text)
 
-    origin, destination = split_route(text)
+    origin, destination = find_route(text)
+    if not origin or not destination:
+        origin, destination = split_route(text)
     if not origin or not destination:
         origin = clean_field(extract_after_label(text, ["From", "Origin", "Boarding From", "Source"]))
         destination = clean_field(extract_after_label(text, ["To", "Destination", "Drop", "Arrival"]))
@@ -905,6 +949,10 @@ def fix_route(fields):
         fields["to"] = f"{f_parts[1][0].strip()} ({f_parts[1][1]})"
     elif len(t_parts) >= 2:
         fields["to"] = f"{t_parts[-1][0].strip()} ({t_parts[-1][1]})"
+    # origin and destination can never be the same station
+    if fields.get("from") and fields.get("to") and _station_code(fields["from"]) == _station_code(fields["to"]) \
+            and _station_base(fields["from"]) == _station_base(fields["to"]):
+        fields["to"] = ""
     return fields
 
 
