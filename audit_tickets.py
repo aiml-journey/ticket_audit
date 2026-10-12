@@ -371,6 +371,25 @@ def find_name_in_text(mis_name, text):
 STATION_TOKEN = re.compile(r"([A-Z][A-Za-z .&'\-]{1,40}?)\s*\(([A-Z]{2,5})\)")
 
 
+# Words that can never be part of a station name (quota, class, fare labels, ...)
+NON_STATION_WORDS = {"TATKAL", "PREMIUM", "GENERAL", "LADIES", "QUOTA", "CLASS", "SLEEPER",
+                     "SEATER", "CHAIR", "CAR", "SITTING", "TIER", "FARE", "PNR", "TRAIN",
+                     "PASSENGER", "SENIOR", "CITIZEN", "DISTANCE", "TOTAL", "CHARGES",
+                     "DEPARTURE", "ARRIVAL", "BOOKING", "TICKET", "RESERVATION", "DIVYANGJAN",
+                     "DUTY", "PASS", "LOWER", "BERTH", "DEFENCE", "YUVA", "FOREIGN", "TOURIST"}
+
+
+def station_tokens(text):
+    """(name, code) pairs that really look like stations; quota/class labels are skipped."""
+    result = []
+    for name, code in STATION_TOKEN.findall(text or ""):
+        words = set(re.findall(r"[A-Z]+", name.upper()))
+        if words & NON_STATION_WORDS:
+            continue
+        result.append((name.strip(), code))
+    return result
+
+
 def split_route(text):
     """
     Finds the origin and destination when they appear on one line, e.g.
@@ -379,7 +398,7 @@ def split_route(text):
     """
     best = []
     for line in text.replace("\xa0", " ").splitlines():
-        found = STATION_TOKEN.findall(line)
+        found = station_tokens(line)
         if len(found) >= 2 and len(found) > len(best):
             best = found
     if len(best) >= 2:
@@ -402,7 +421,7 @@ def find_route(text):
         return "", ""
     region = t[m.end(): m.end() + 400]
     seq = []
-    for name, code in STATION_TOKEN.findall(region):
+    for name, code in station_tokens(region):
         if not seq or seq[-1][1] != code:
             seq.append((name.strip(), code))
     if len(seq) < 2:
@@ -965,8 +984,14 @@ def fix_route(fields):
     Makes sure From holds only the origin station and To only the destination,
     even when a PDF puts the whole route into one of the two fields.
     """
-    f_parts = STATION_TOKEN.findall(fields.get("from", "") or "")
-    t_parts = STATION_TOKEN.findall(fields.get("to", "") or "")
+    f_parts = station_tokens(fields.get("from", "") or "")
+    t_parts = station_tokens(fields.get("to", "") or "")
+
+    # A value that only contains a quota/class label (e.g. 'Tatkal (TQ)') is not a station
+    for key, parts in (("from", f_parts), ("to", t_parts)):
+        raw = fields.get(key, "") or ""
+        if not parts and STATION_TOKEN.search(raw):
+            fields[key] = ""
 
     if len(f_parts) >= 2:
         fields["from"] = f"{f_parts[0][0].strip()} ({f_parts[0][1]})"
