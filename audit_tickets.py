@@ -309,7 +309,7 @@ def extract_irctc_passengers(text):
     names = []
     for line in block.splitlines():
         m = re.match(
-            r"^\s*\d+\s+([A-Za-z][A-Za-z .'\-]*?)"
+            r"^\s*\d+[.)]?\s+([A-Za-z][A-Za-z .'\-]*?)"
             r"(?=\s+\d{1,3}\b|\s+(?:Male|Female|Transgender|M|F)\b|\s{2,}|$)",
             line,
         )
@@ -410,12 +410,29 @@ def split_route(text):
 
 def find_route(text):
     """
-    Reads origin and destination from the boarding part of the slip.
-    Starts at 'Boarding From', takes the stations in order, and returns the
-    first station as origin and the next DIFFERENT station as destination.
+    Reads origin and destination from the route part of the slip.
+    Layout A: 'Booked From | Boarding At | To' on one value line, e.g.
+      'SANTRAGACHI JN (SRC) SANTRAGACHI JN (SRC) VISAKHAPATNAM (VSKP)'
+      -> origin SANTRAGACHI (SRC), destination = last station (VSKP)
+    Layout B: 'Boarding From' heading followed by the stations.
+      -> origin = first station, destination = next DIFFERENT station.
     Returns ('', '') when that is not possible, so the caller can fall back.
     """
     t = _clean(text)
+
+    m = re.search(r"Booked From\s+Boarding\s+At\s+To|Booked From\s+To", t, re.I)
+    if m:
+        region = t[m.end(): m.end() + 300]
+        seq = []
+        for name, code in station_tokens(region):
+            if not seq or seq[-1][1] != code:
+                seq.append((name.strip(), code))
+        if len(seq) >= 2:
+            origin = seq[0]
+            dest = next((s for s in reversed(seq[1:]) if s[1] != origin[1]), None)
+            if dest is not None:
+                return f"{origin[0]} ({origin[1]})", f"{dest[0]} ({dest[1]})"
+
     m = re.search(r"Boarding From", t, re.I)
     if not m:
         return "", ""
