@@ -131,7 +131,7 @@ def quota_matches(mis_quota, pdf_quota, railway):
     if not railway:
         return True
     if not mis_quota and not pdf_quota:
-        return True
+        return True  # neither side has a quota: nothing to compare
     if not mis_quota or not pdf_quota:
         return False
     return _canon_quota(mis_quota) == _canon_quota(pdf_quota)
@@ -502,6 +502,32 @@ QUOTA_NAMES = [
 ]
 
 
+QUOTA_CODES = {
+    "GN": "General", "TQ": "Tatkal", "PT": "Premium Tatkal", "LD": "Ladies",
+    "SS": "Senior Citizen", "DF": "Defence Quota", "HP": "Person With Disability",
+    "DP": "Duty Pass", "FT": "Foreign Tourist", "YU": "Yuva", "LB": "Lower Berth",
+    "DV": "Divyangjan",
+}
+
+
+def extract_quota_anywhere(text):
+    """
+    Quota from the slip header first; if the header layout is not understood,
+    the whole slip is searched for a quota name or its code, e.g. '(GN)', '(TQ)', '(PT)'.
+    """
+    t = _clean(text)
+    q = extract_quota(t)
+    if q:
+        return q
+    m = re.search(r"\((" + "|".join(QUOTA_CODES) + r")\)", t)
+    if m:
+        return QUOTA_CODES[m.group(1)]
+    for name in QUOTA_NAMES:
+        if re.search(r"(?<![A-Za-z])" + re.escape(name) + r"(?![A-Za-z])", t, re.I):
+            return name
+    return ""
+
+
 def extract_quota(text):
     """
     Reads the quota from the slip header, e.g.
@@ -553,7 +579,7 @@ def extract_irctc_ers(text):
         m = re.search(r"(" + CLASS_NAMES + r")\s*\(([A-Z0-9]{1,3})\)", t)
     if m: out["class"] = f"{m.group(1)} ({m.group(2)})"
 
-    out["quota"] = extract_quota(t)
+    out["quota"] = extract_quota_anywhere(t)
 
     m = re.search(r"Departure\*?\s*\d{1,2}:\d{2}\s+(\d{1,2}-[A-Za-z]{3}-\d{4})", t)
     if m:
@@ -963,7 +989,7 @@ def extract_generic_fields(text):
                 travel_class = code
                 break
 
-    quota = extract_quota(text)
+    quota = extract_quota_anywhere(text)
 
     travel_date = find_travel_date(text)
 
@@ -994,6 +1020,35 @@ def extract_generic_fields(text):
         "to": destination,
         "fare": fare,
     }
+
+
+def find_station_in_text(mis_station, text, avoid_station=""):
+    """
+    Searches the whole PDF text for the MIS station, when the usual route reader
+    did not find it. Matches either the station code (e.g. 'BH' in 'BHARUCH JN (BH)')
+    or the city name (e.g. 'Nagpur', 'Bengaluru' for MIS 'Bangalore').
+    The origin station is never returned. Returns the real text found, or ''.
+    """
+    base = _station_base(mis_station)
+    code = _station_code(mis_station)
+    avoid = _station_base(avoid_station) if avoid_station else ""
+    if not base and not code:
+        return ""
+
+    t = _clean(text)
+
+    for name, c in station_tokens(t):
+        cand = f"{name} ({c})"
+        if _station_base(cand) == avoid and avoid:
+            continue
+        if (code and c == code) or (base and _station_base(cand) == base):
+            return cand
+
+    if base and base != avoid:
+        for w in re.findall(r"[A-Za-z]{4,}", t):
+            if _station_base(w) == base:
+                return w
+    return ""
 
 
 def fix_route(fields):
@@ -1249,11 +1304,21 @@ def audit_tickets(excel_path, tickets_dir, output_path,
                 if found:
                     p_pax = found
                     name_ok = True
+            if railway and not p_quota:
+                p_quota = extract_quota_anywhere(pdf.get("text", ""))
             class_ok = (classes_match if railway else bus_classes_match)(rec["class"], p_class)
             quota_ok = quota_matches(rec["quota"], p_quota, railway)
             date_ok = dates_match(normalize_date(rec["travel_date"]), p_date)
             from_ok = stations_match(rec["from"], p_from)
+            if not from_ok and rec["from"]:
+                found_from = find_station_in_text(rec["from"], pdf.get("text", ""), avoid_station=p_to)
+                if found_from and stations_match(rec["from"], found_from):
+                    p_from, from_ok = found_from, True
             to_ok = stations_match(rec["to"], p_to)
+            if not to_ok and rec["to"]:
+                found_to = find_station_in_text(rec["to"], pdf.get("text", ""), avoid_station=p_from)
+                if found_to and stations_match(rec["to"], found_to):
+                    p_to, to_ok = found_to, True
             fare_ok = fare_matches(rec["amount"], pdf_fields.get("fare", ""), pnr_totals.get(rec["pnr"]))
 
             status = make_status([name_ok, class_ok, quota_ok, date_ok, from_ok, to_ok, fare_ok])
