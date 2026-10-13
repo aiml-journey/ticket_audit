@@ -1147,19 +1147,29 @@ def build_pdf_index(tickets_dir, mis_pnrs):
     index, unmatched = {}, []
 
     for path in pdf_files:
-        text = extract_pdf_text(path)
-        text_upper = normalize_text(text)
-        fields = extract_pdf_fields(path, text)
         file_name = os.path.basename(path)
+        try:
+            text = extract_pdf_text(path)
+            text_upper = normalize_text(text)
+            fields = extract_pdf_fields(path, text)
+        except Exception as exc:
+            # One unreadable PDF must not stop the whole audit
+            text, text_upper = "", ""
+            fields = {"mode": "", "pnr": "", "passenger": "", "passengers": [],
+                      "class": "", "quota": "", "travel_date": "", "from": "", "to": "",
+                      "fare": "", "read_error": f"{type(exc).__name__}: {exc}"}
 
-        # Candidate PNRs from the filename and from the slip itself
+        # Candidate PNRs from the filename and from the IRCTC slip itself
         hints = []
         m = FILENAME_PNR.match(file_name)
         if m:
             hints.append(normalize_text(m.group(1)))
-        slip_pnr = normalize_text(fields.get("pnr", "")) if fields.get("mode") in ("Train", "Bus", "Flight") else ""
-        if slip_pnr:
-            hints.append(slip_pnr)
+        irctc_pnr = normalize_text(fields.get("pnr", "")) if fields.get("mode") == "Train" else ""
+        if irctc_pnr:
+            hints.append(irctc_pnr)
+
+        if not text.strip() and "read_error" not in fields:
+            fields["read_error"] = "no readable text (corrupt or scanned file)"
 
         entry = {"file": file_name, "path": path, "fields": fields, "text": text}
 
@@ -1325,6 +1335,8 @@ def audit_tickets(excel_path, tickets_dir, output_path,
             counts[status] += 1
 
             problems = []
+            if pdf_fields.get("read_error"):
+                problems.append(f"PDF could not be read: {pdf_fields['read_error']}")
             if not name_ok:
                 problems.append(f"Passenger Name Mismatch: Excel '{clean(rec['passenger'])}' vs PDF '{p_pax}'")
             if not class_ok:
@@ -1378,11 +1390,12 @@ def audit_tickets(excel_path, tickets_dir, output_path,
         counts["UNRECORDED"] += 1
         p_date = normalize_date(fields.get("travel_date", ""))
         p_fare = normalize_number(fields.get("fare", ""))
-        remarks = (
-            "Found in PDF folder, missing in Excel MIS report"
-            if pnr else
-            "Found in PDF folder, PNR could not be read from file"
-        )
+        if fields.get("read_error"):
+            remarks = f"PDF could not be read: {fields['read_error']}"
+        elif pnr:
+            remarks = "Found in PDF folder, missing in Excel MIS report"
+        else:
+            remarks = "Found in PDF folder, PNR could not be read from file"
 
         recon_rows.append([
             "UNRECORDED", pnr, fields.get("mode", ""), "", entry["file"],
