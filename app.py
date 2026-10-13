@@ -1,9 +1,11 @@
 import os
 import uuid
+import traceback
 from pathlib import Path
 
 from flask import Flask, request, send_file, jsonify
 from werkzeug.utils import secure_filename
+from werkzeug.exceptions import RequestEntityTooLarge
 
 from audit_tickets import audit_tickets
 
@@ -14,12 +16,18 @@ BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_FOLDER = BASE_DIR / "uploads"
 UPLOAD_FOLDER.mkdir(exist_ok=True)
 
-app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
+# Allow large batches of scanned ticket PDFs (500 MB per request)
+app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
 
 EXCEL_MIME = (
     "application/vnd.openxmlformats-"
     "officedocument.spreadsheetml.sheet"
 )
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def too_large(_e):
+    return jsonify({"error": "Upload too large", "details": "Total upload is over 500 MB"}), 413
 
 
 @app.route("/")
@@ -65,7 +73,9 @@ def audit_api():
             pdf_filename = secure_filename(pdf.filename)
             if not pdf_filename.lower().endswith(".pdf"):
                 continue
-            pdf.save(str(tickets_dir / pdf_filename))
+            # Keep every file, even if two uploads share a name
+            target = tickets_dir / f"{pdf_count:04d}_{pdf_filename}"
+            pdf.save(str(target))
             pdf_count += 1
 
         if pdf_count == 0:
@@ -88,7 +98,10 @@ def audit_api():
         )
 
     except Exception as e:
-        return jsonify({"error": "Audit failed", "details": str(e)}), 500
+        # Show the real reason (type and message) and keep the full trace in the server log
+        traceback.print_exc()
+        reason = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+        return jsonify({"error": "Audit failed", "details": reason}), 500
 
 
 if __name__ == "__main__":
