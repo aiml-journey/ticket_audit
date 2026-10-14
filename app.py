@@ -90,9 +90,12 @@ def start_audit():
     mis_path = session_dir / mis_filename
     mis_file.save(str(mis_path))
 
-    # Keep every PDF, even when two have the same name
+    # Keep every PDF, even when two have the same name.
+    # The extension is always saved in lower case (.pdf) so every file is found on Linux (Render),
+    # where file search is case-sensitive: ".PDF" would otherwise be missed.
     for i, pdf in enumerate(pdf_files):
-        pdf.save(str(tickets_dir / f"{i:04d}_{secure_filename(pdf.filename)}"))
+        stem = os.path.splitext(secure_filename(pdf.filename))[0] or "ticket"
+        pdf.save(str(tickets_dir / f"{i:04d}_{stem}.pdf"))
 
     output_path = session_dir / f"Audited_{mis_filename}"
 
