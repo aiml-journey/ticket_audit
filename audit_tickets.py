@@ -451,7 +451,7 @@ def find_route(text):
 
 
 DATE_TOKEN = re.compile(r"\b\d{1,2}[-/ ](?:\d{1,2}|[A-Za-z]{3,9})[-/ ]\d{4}\b")
-NOT_TRAVEL_LINE = re.compile(r"Print|Booking|Issue|Issued|Generated|Purchase|Created|Invoice|Payment|Arrival", re.I)
+NOT_TRAVEL_LINE = re.compile(r"Print|Booking|Issue|Issued|Generated|Purchase|Created|Invoice|Payment|Arrival|Service|Charge|Fee|GST|Insurance", re.I)
 TRAVEL_LINE = re.compile(r"Depart|Journey|Travel|Boarding|Onward|Return", re.I)
 
 
@@ -918,10 +918,13 @@ def extract_pdf_text(pdf_path):
 NOISE = re.compile(r"SUPPLIER|ADDRESS|STATE NAME|TERMS|INSTRUCTION|CERTIFICATE", re.I)
 
 
+FEE_LABEL = re.compile(r"SERVICE|CHARGE|FEE|INSURANCE|\bGST\b|TOTAL|FARE|AMOUNT|PRINTING|CONVENIENCE", re.I)
+
+
 def clean_field(value):
-    """Rejects values that look like label text or boilerplate."""
+    """Rejects values that look like label text, fee lines or boilerplate."""
     value = clean(value)
-    if not value or len(value) > 60 or ":" in value or NOISE.search(value):
+    if not value or len(value) > 60 or ":" in value or NOISE.search(value) or FEE_LABEL.search(value):
         return ""
     return value
 
@@ -975,12 +978,62 @@ def extract_bus_class(text):
     return re.sub(r"\s+", " ", m.group(1)).strip().rstrip(".,")
 
 
+# Words that show a line is a fee or amount, never a travel class
+NOT_CLASS_WORDS = re.compile(
+    r"SERVICE|CHARGE|FEE|TAX|GST|CONVENIENCE|INSURANCE|PREMIUM|TOTAL|AMOUNT|PAYMENT|FARE|PRICE",
+    re.I,
+)
+
+
+def is_real_class(value):
+    """True only for a class name, not a fee line such as 'Service Charge'."""
+    return bool(value) and not NOT_CLASS_WORDS.search(value)
+
+
+def extract_class_anywhere(text):
+    """Finds a travel class name in the slip, e.g. 'THIRD AC (3A)' or 'SECOND SITTING (2S)'."""
+    t = _clean(text)
+    m = re.search(r"(" + CLASS_NAMES + r")\s*\(([A-Z0-9]{1,3})\)", t, re.I)
+    if m:
+        return f"{m.group(1).upper()} ({m.group(2).upper()})"
+    return ""
+
+
+FARE_LABELS = (
+    r"Total Fare|Total Amount|Grand Total|Amount Paid|Total Price|Total Payable|"
+    r"Paid Amount|Amount Payable|Ticket Fare|Total Ticket Price|Net Amount"
+)
+
+
+def extract_fare_anywhere(text):
+    """
+    Total amount on the slip. Takes the last total in the document (the final figure),
+    allowing a few words between the label and the amount, e.g.
+      'Total Fare (incl. all taxes)  INR 33187.0'   or   'Grand Total ₹ 4,520.00'
+    """
+    t = _clean(text)
+    pattern = re.compile(
+        r"(?:" + FARE_LABELS + r")[^\d\n]{0,60}?(?:₹|INR|Rs\.?)?\s*([\d,]+(?:\.\d{1,2})?)",
+        re.I,
+    )
+    found = pattern.findall(t)
+    return found[-1] if found else ""
+
+
 def extract_generic_fields(text):
     upper = normalize_text(text)
 
     passenger = generic_passenger(text)
 
-    travel_class = clean_field(extract_after_label(text, ["Class", "Travel Class"]))
+    travel_class = ""
+    m = re.search(r"(" + CLASS_NAMES + r")\s*\(([A-Z0-9]{1,3})\)", _clean(text))
+    if m:
+        travel_class = f"{m.group(1)} ({m.group(2)})"
+    if not travel_class:
+        travel_class = extract_class_anywhere(text)
+    if not travel_class:
+        label_value = clean_field(extract_after_label(text, ["Class", "Travel Class"]))
+        travel_class = label_value if is_real_class(label_value) else ""
     if not travel_class:
         travel_class = extract_bus_class(text)
     if not travel_class:
@@ -1000,14 +1053,7 @@ def extract_generic_fields(text):
         origin = clean_field(extract_after_label(text, ["From", "Origin", "Boarding From", "Source"]))
         destination = clean_field(extract_after_label(text, ["To", "Destination", "Drop", "Arrival"]))
 
-    fare = ""
-    for pattern in [
-        r"(?:Total Fare|Ticket Fare|Ticket Amount|Amount Payable|Total Amount)\s*[:\-]?\s*(?:₹|INR|Rs\.?)?\s*([\d,]+(?:\.\d+)?)",
-    ]:
-        found = re.findall(pattern, text, re.IGNORECASE)
-        if found:
-            fare = found[-1]
-            break
+    fare = extract_fare_anywhere(text)
 
     return {
         "pnr": extract_pnr(text),
