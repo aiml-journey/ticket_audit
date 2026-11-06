@@ -91,20 +91,48 @@ def class_code(value):
     return ""
 
 
+def _bus_class_signature(value):
+    """Return comparable bus-class attributes without treating missing data as a match."""
+    text = _up(value).replace("A/C", "AC").replace("NON AC", "NONAC")
+    text = re.sub(r"\s+", " ", text).strip()
+
+    kind = "SLEEPER" if re.search(r"\bSLEEPER\b", text) else (
+        "SEATER" if re.search(r"\bSEATER\b", text) else ""
+    )
+    if not kind and re.search(r"\b(LUXURY|VOLVO|MULTI AXLE|MULTIAXLE)\b", text):
+        kind = "LUXURY"
+
+    ac = "NONAC" if re.search(r"\bNON\s*AC\b", text) else (
+        "AC" if re.search(r"\bAC\b", text) else ""
+    )
+    luxury = bool(re.search(r"\b(LUXURY|VOLVO|MULTI AXLE|MULTIAXLE)\b", text))
+    return {"kind": kind, "ac": ac, "luxury": luxury, "text": text}
+
+
 def bus_classes_match(mis_class, pdf_class):
     """
-    Bus operators name classes differently ('AC Sleeper' vs
-    'Bharat Benz A/C Sleeper'; 'AIRAVAT CLUB CLASS'). Only the
-    sleeper/seater split is compared. A missing PDF class is never a match.
+    Compare bus class dimensions conservatively. Missing PDF/MIS classes never
+    count as matches; AC vs non-AC and sleeper vs seater are kept distinct.
     """
-    m, p = _up(mis_class), _up(pdf_class)
-    if not p:
+    if not _up(mis_class) or not _up(pdf_class):
         return False
-    m_kind = "SLEEPER" if "SLEEPER" in m else "SEATER" if "SEATER" in m else ""
-    p_kind = "SLEEPER" if "SLEEPER" in p else "SEATER" if "SEATER" in p else ""
-    if m_kind and p_kind:
-        return m_kind == p_kind
-    return True
+
+    a, b = _bus_class_signature(mis_class), _bus_class_signature(pdf_class)
+
+    # If both identify a layout, it must agree.
+    if a["kind"] and b["kind"] and a["kind"] != b["kind"]:
+        return False
+    # AC/non-AC only conflicts when both sides explicitly specify it.
+    if a["ac"] and b["ac"] and a["ac"] != b["ac"]:
+        return False
+    # A luxury label is meaningful when either side explicitly uses it.
+    if a["luxury"] != b["luxury"] and (a["luxury"] or b["luxury"]):
+        return False
+
+    # Avoid the old permissive behavior where any two non-empty labels matched.
+    if a["kind"] or b["kind"] or a["ac"] or b["ac"] or a["luxury"] or b["luxury"]:
+        return bool(a["kind"] or b["kind"] or a["ac"] or b["ac"] or a["luxury"] or b["luxury"])
+    return a["text"] == b["text"]
 
 
 def classes_match(mis_class, pdf_class):
@@ -326,7 +354,7 @@ def generic_passenger(text):
     """Only accepts an explicit 'Passenger Name' label with a real name after it."""
     m = re.search(r"Passenger Name\s*[:\-|]?\s*([A-Za-z][A-Za-z .'\-]{2,60})", text, re.I)
     if m and looks_like_name(m.group(1)):
-        return m.group(1).strip()
+        return m.group(1).strip(" -:|")
     return ""
 
 
@@ -543,7 +571,9 @@ def extract_quota(text):
     """
     t = text.replace("\xa0", " ")
     heading = re.search(r"\bQuota\b", t, re.I)
-    window = t[heading.end(): heading.end() + 250] if heading else t
+    if not heading:
+        return ""
+    window = t[heading.end(): heading.end() + 250]
 
     best = None
     for name in QUOTA_NAMES:
@@ -968,19 +998,50 @@ QUOTA_WORDS = ["PREMIUM TATKAL", "TATKAL", "GENERAL", "LADIES", "SENIOR CITIZEN"
 
 
 BUS_CLASS_PATTERN = re.compile(
-    r"((?:Volvo|Bharat Benz|Scania|Mercedes|Eicher|Ashok Leyland|AIRAVAT)[^\n]{0,45}"
-    r"|(?:Non[ -]?A/?C|A/?C)\s*(?:Semi[ -]?)?(?:Sleeper|Seater)(?:\s*\(\d\+\d\))?"
-    r"|(?:Non[ -]?A/?C)\s*(?:Sleeper|Seater))",
+    r"\b(?:NON\s*-?\s*AC|A\s*/\s*C|AC)\s*"
+    r"(?:FULL\s+)?(?:LUXURY|SEMI\s*-?\s*)?(?:SLEEPER|SEATER|LUXURY)"
+    r"(?:\s*\([^)]{1,12}\))?",
+    re.I,
+)
+
+BUS_CLASS_LABEL = re.compile(
+    r"\b(?:Class|Bus Type|Travel Class)\s*[:|\-]?\s*"
+    r"(.{2,90}?)(?=\s+(?:Pickup Point|Service From|Service To|Journey Date|"
+    r"Departure Time|Route No|Trip Code|No\.of Seats)|[\r\n]|$)",
     re.I,
 )
 
 
 def extract_bus_class(text):
-    """Bus class as printed on the ticket, e.g. 'Volvo 9600 SLX Multi-Axle', 'Bharat Benz A/C Seater'."""
-    m = BUS_CLASS_PATTERN.search(_clean(text))
-    if not m:
-        return ""
-    return re.sub(r"\s+", " ", m.group(1)).strip().rstrip(".,")
+    """Extract bus class from explicit Class/Bus Type labels or private Trip Name."""
+    t = _clean(text)
+
+    m = BUS_CLASS_LABEL.search(t)
+    if m:
+        value = re.sub(r"\s+", " ", m.group(1)).strip(" :-|")
+        if value and len(value) <= 70 and not NOT_CLASS_WORDS.search(value):
+            return value.upper()
+
+    for line in t.splitlines():
+        if re.search(r"\bTrip Name\s*:", line, re.I):
+            tail = re.split(r"\bTrip Name\s*:", line, maxsplit=1, flags=re.I)[-1]
+            matches = list(BUS_CLASS_PATTERN.finditer(tail))
+            if matches:
+                return re.sub(r"\s+", " ", matches[-1].group(0)).upper()
+
+    branded = re.search(
+        r"\b(?:VOLVO|BHARAT BENZ|SCANIA|MERCEDES|EICHER|ASHOK LEYLAND|AIRAVAT)"
+        r"[^\n]{0,55}", t, re.I
+    )
+    if branded:
+        candidate = re.sub(r"\s+", " ", branded.group(0)).strip(" :-|")
+        if re.search(r"\b(SLEEPER|SEATER|LUXURY|AC|NON\s*AC)\b", candidate, re.I):
+            return candidate.upper()
+
+    m = BUS_CLASS_PATTERN.search(t)
+    if m:
+        return re.sub(r"\s+", " ", m.group(0)).upper()
+    return ""
 
 
 # Words that show a line is a fee or amount, never a travel class
@@ -1039,6 +1100,19 @@ def extract_generic_fields(text):
     upper = normalize_text(text)
 
     passenger = generic_passenger(text)
+    if not passenger:
+        # redBus/RTC style: passenger table headed "Name Age Adult/Child Gender"
+        m = re.search(
+            r"\bName\s+Age\s+Adult/Child\s+Gender\s*(.*?)(?:ID Card Type|Total Fare Details|$)",
+            _clean(text), re.I | re.S
+        )
+        if m:
+            pax = re.search(
+                r"^\s*([A-Za-z][A-Za-z .'-]{1,55}?)\s+\d{1,3}\s+(?:Adult|Child)\s+(?:Male|Female|Other)\b",
+                m.group(1), re.I | re.M
+            )
+            if pax and looks_like_name(pax.group(1)):
+                passenger = re.sub(r"\s+", " ", pax.group(1)).strip()
 
     travel_class = ""
     m = re.search(r"(" + CLASS_NAMES + r")\s*\(([A-Z0-9]{1,3})\)", _clean(text))
@@ -1059,11 +1133,31 @@ def extract_generic_fields(text):
                 travel_class = code
                 break
 
-    quota = extract_quota_anywhere(text)
+    quota = extract_quota(text)
 
     travel_date = find_travel_date(text)
 
-    origin, destination = find_route(text)
+    # Private operator layouts often encode the route in "Trip Name: CITY TO CITY - BUS TYPE".
+    trip_route = re.search(
+        r"\bTrip Name\s*:\s*([A-Za-z .'-]{2,45}?)\s+TO\s+([A-Za-z .'-]{2,45}?)\s+-",
+        _clean(text), re.I
+    )
+    if trip_route:
+        origin = re.sub(r"\s+", " ", trip_route.group(1)).strip(" -")
+        destination = re.sub(r"\s+", " ", trip_route.group(2)).strip(" -")
+    else:
+        origin = destination = ""
+
+    # RedBus/RTC layouts may place both journey endpoints on one line.
+    bus_route = re.search(
+        r"\bJourney From\s*:\s*(.*?)\s+Journey To\s*:\s*([^\r\n]+)",
+        _clean(text), re.I
+    )
+    if bus_route:
+        origin = re.sub(r"\s+", " ", bus_route.group(1)).strip()
+        destination = re.sub(r"\s+", " ", bus_route.group(2)).strip()
+    elif not origin or not destination:
+        origin, destination = find_route(text)
     if not origin or not destination:
         origin, destination = split_route(text)
     if not origin or not destination:
@@ -1071,8 +1165,15 @@ def extract_generic_fields(text):
     if not origin or not destination:
         origin, destination = extract_code_pair_route(text)
     if not origin or not destination:
-        origin = clean_field(extract_after_label(text, ["From", "Origin", "Boarding From", "Source"]))
-        destination = clean_field(extract_after_label(text, ["To", "Destination", "Drop", "Arrival"]))
+        # Bus tickets often use "Journey From/To" or "Service From/To".
+        journey_from = extract_after_label(text, ["Journey From", "Service From"])
+        journey_to = extract_after_label(text, ["Journey To", "Service To"])
+        origin = clean_field(journey_from) or clean_field(
+            extract_after_label(text, ["From", "Origin", "Boarding From", "Source"])
+        )
+        destination = clean_field(journey_to) or clean_field(
+            extract_after_label(text, ["To", "Destination", "Drop", "Arrival"])
+        )
 
     fare = extract_fare_anywhere(text)
 
@@ -1197,7 +1298,7 @@ def _extract_pdf_fields_raw(pdf_path, text=None):
                 fields[key] = generic.get(key, "")
         return fields
 
-    generic["mode"] = ""
+    generic["mode"] = "Bus" if extract_bus_class(text) else ""
     return generic
 
 
