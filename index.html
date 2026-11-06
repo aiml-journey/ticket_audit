@@ -68,6 +68,30 @@ function show(text, cls) {
   statusBox.className = cls || '';
 }
 
+async function downloadResult(jobId) {
+  const started = Date.now();
+  show('Audit finished. Downloading the sheet...', 'done');
+  try {
+    const res = await fetch('/api/download/' + jobId);
+    if (!res.ok) throw new Error(`server returned ${res.status}`);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'Audited_sheet.xlsx';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    const secs = ((Date.now() - started) / 1000).toFixed(1);
+    show(`Download ready: ${(blob.size / 1024).toFixed(0)} KB, received in ${secs}s.`, 'done');
+  } catch (err) {
+    show('Download failed: ' + err.message + '. Click Run audit again.', 'error');
+  } finally {
+    runBtn.disabled = false;
+  }
+}
+
 async function runAudit() {
   runBtn.disabled = true;
   show('Uploading files...');
@@ -96,9 +120,7 @@ async function runAudit() {
         show(`Auditing ${s.pdf_count} tickets... ${s.elapsed_seconds}s elapsed.\nYou can keep this page open.`);
         setTimeout(poll, 3000);
       } else if (s.state === 'done') {
-        show('Audit finished. Downloading the sheet...', 'done');
-        window.location = '/api/download/' + jobId;
-        runBtn.disabled = false;
+        await downloadResult(jobId);
       } else {
         show('Audit failed: ' + (s.error || 'unknown error'), 'error');
         runBtn.disabled = false;
