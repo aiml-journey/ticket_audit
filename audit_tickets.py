@@ -99,13 +99,13 @@ def _bus_class_signature(value):
     kind = "SLEEPER" if re.search(r"\bSLEEPER\b", text) else (
         "SEATER" if re.search(r"\bSEATER\b", text) else ""
     )
-    if not kind and re.search(r"\b(LUXURY|VOLVO|MULTI AXLE|MULTIAXLE)\b", text):
+    if not kind and re.search(r"\bLUXURY\b", text):
         kind = "LUXURY"
 
     ac = "NONAC" if re.search(r"\bNON\s*AC\b", text) else (
         "AC" if re.search(r"\bAC\b", text) else ""
     )
-    luxury = bool(re.search(r"\b(LUXURY|VOLVO|MULTI AXLE|MULTIAXLE)\b", text))
+    luxury = bool(re.search(r"\bLUXURY\b", text))
     return {"kind": kind, "ac": ac, "luxury": luxury, "text": text}
 
 
@@ -328,7 +328,10 @@ def looks_like_name(value):
 
 
 def extract_irctc_passengers(text):
-    """Reads the 'Passenger Details' table; works with or without age/gender on the row."""
+    """Reads IRCTC passenger rows, including compact numbering such as
+    ``1.KUMARAN G 47 M`` (no space after the passenger number), as well as
+    conventional ``1. KUMARAN G 47 M`` layouts.
+    """
     # The table row can appear before or after the heading in the extracted text,
     # so start at the table header if present, otherwise scan the whole text.
     text = text.replace("\xa0", " ")
@@ -341,7 +344,7 @@ def extract_irctc_passengers(text):
     names = []
     for line in block.splitlines():
         m = re.match(
-            r"^\s*\d+[.)]?\s+([A-Za-z][A-Za-z .'\-]*?)"
+            r"^\s*\d+[.)]?\s*([A-Za-z][A-Za-z .'\-]*?)"
             r"(?=\s+\d{1,3}\b|\s+(?:Male|Female|Transgender|M|F)\b|\s{2,}|$)",
             line,
         )
