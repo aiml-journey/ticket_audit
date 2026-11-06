@@ -201,6 +201,10 @@ def stations_match(mis_station, pdf_station):
     if pdf_code and mis_base in CITY_CODE_ALIASES:
         return pdf_code in CITY_CODE_ALIASES[mis_base]
 
+    # MIS holds only the airport/station code, e.g. 'NAG' vs 'Dr. Babasaheb ... (NAG)'
+    if pdf_code and mis_base == pdf_code:
+        return True
+
     return False
 
 
@@ -628,6 +632,7 @@ AIRPORT_NAMES = {
     "DEL": "Indira Gandhi International Airport",
     "BLR": "Kempegowda International Airport",
     "MAA": "Chennai International Airport",
+    "NAG": "Nagpur",
 }
 
 
@@ -964,7 +969,7 @@ QUOTA_WORDS = ["PREMIUM TATKAL", "TATKAL", "GENERAL", "LADIES", "SENIOR CITIZEN"
 
 BUS_CLASS_PATTERN = re.compile(
     r"((?:Volvo|Bharat Benz|Scania|Mercedes|Eicher|Ashok Leyland|AIRAVAT)[^\n]{0,45}"
-    r"|(?:Non[ -]?A/?C|A/?C)\s*(?:Semi[ -]?)?(?:Sleeper|Seater)[^\n]{0,15}"
+    r"|(?:Non[ -]?A/?C|A/?C)\s*(?:Semi[ -]?)?(?:Sleeper|Seater)(?:\s*\(\d\+\d\))?"
     r"|(?:Non[ -]?A/?C)\s*(?:Sleeper|Seater))",
     re.I,
 )
@@ -990,6 +995,15 @@ def is_real_class(value):
     return bool(value) and not NOT_CLASS_WORDS.search(value)
 
 
+FLIGHT_CLASS = re.compile(r"\b(Premium Economy|Economy|Business)\b\s*,?\s*(?:Class\b)?", re.I)
+
+
+def extract_flight_class(text):
+    """Cabin class on an airline ticket, e.g. 'Economy, Class SM' -> 'Economy'."""
+    m = FLIGHT_CLASS.search(_clean(text))
+    return m.group(1).title() if m else ""
+
+
 def extract_class_anywhere(text):
     """Finds a travel class name in the slip, e.g. 'THIRD AC (3A)' or 'SECOND SITTING (2S)'."""
     t = _clean(text)
@@ -1013,10 +1027,11 @@ def extract_fare_anywhere(text):
     """
     t = _clean(text)
     pattern = re.compile(
-        r"(?:" + FARE_LABELS + r")[^\d\n]{0,60}?(?:₹|INR|Rs\.?)?\s*([\d,]+(?:\.\d{1,2})?)",
+        r"(?:" + FARE_LABELS + r")[^\d]{0,60}?"
+        r"(?:(?:₹|INR|Rs\.?)\s*([\d,]+(?:\.\d{1,2})?)|([\d,]+\.\d{2}))",
         re.I,
     )
-    found = pattern.findall(t)
+    found = [g1 or g2 for g1, g2 in pattern.findall(t)]
     return found[-1] if found else ""
 
 
@@ -1031,6 +1046,8 @@ def extract_generic_fields(text):
         travel_class = f"{m.group(1)} ({m.group(2)})"
     if not travel_class:
         travel_class = extract_class_anywhere(text)
+    if not travel_class:
+        travel_class = extract_flight_class(text)
     if not travel_class:
         label_value = clean_field(extract_after_label(text, ["Class", "Travel Class"]))
         travel_class = label_value if is_real_class(label_value) else ""
@@ -1050,6 +1067,10 @@ def extract_generic_fields(text):
     if not origin or not destination:
         origin, destination = split_route(text)
     if not origin or not destination:
+        origin, destination = extract_arrow_route(text)
+    if not origin or not destination:
+        origin, destination = extract_code_pair_route(text)
+    if not origin or not destination:
         origin = clean_field(extract_after_label(text, ["From", "Origin", "Boarding From", "Source"]))
         destination = clean_field(extract_after_label(text, ["To", "Destination", "Drop", "Arrival"]))
 
@@ -1066,6 +1087,30 @@ def extract_generic_fields(text):
         "to": destination,
         "fare": fare,
     }
+
+
+ARROW_ROUTE = re.compile(r"([A-Z][A-Za-z ]{2,30}?)\s*(?:→|->)\s*([A-Z][A-Za-z ]{2,30}?)\s+on\s+\d{1,2}-", re.I)
+
+
+def extract_arrow_route(text):
+    """Bus/route heading such as 'Gwalior -> Ujjain on 12-Oct-2026'."""
+    m = ARROW_ROUTE.search(_clean(text))
+    if not m:
+        return "", ""
+    origin = re.sub(r"^.*?\b(?:AM|PM)\s+", "", m.group(1).strip())
+    return origin, m.group(2).strip()
+
+
+# Airport codes that appear as 'NAG - BOM' on airline e-tickets
+CODE_PAIR = re.compile(r"(?<![A-Za-z])([A-Z]{3})\s*-\s*([A-Z]{3})(?![A-Za-z])")
+
+
+def extract_code_pair_route(text):
+    m = CODE_PAIR.search(_clean(text))
+    if not m:
+        return "", ""
+    a, b = m.group(1), m.group(2)
+    return (f"{AIRPORT_NAMES.get(a, a)} ({a})", f"{AIRPORT_NAMES.get(b, b)} ({b})")
 
 
 def find_station_in_text(mis_station, text, avoid_station=""):
@@ -1205,14 +1250,14 @@ def build_pdf_index(tickets_dir, mis_pnrs):
                       "class": "", "quota": "", "travel_date": "", "from": "", "to": "",
                       "fare": "", "read_error": f"{type(exc).__name__}: {exc}"}
 
-        # Candidate PNRs from the filename and from the IRCTC slip itself
+        # Candidate PNRs from the filename and from the slip itself
         hints = []
         m = FILENAME_PNR.match(file_name)
         if m:
             hints.append(normalize_text(m.group(1)))
-        irctc_pnr = normalize_text(fields.get("pnr", "")) if fields.get("mode") == "Train" else ""
-        if irctc_pnr:
-            hints.append(irctc_pnr)
+        slip_pnr = normalize_text(fields.get("pnr", "")) if fields.get("mode") in ("Train", "Bus", "Flight") else ""
+        if slip_pnr:
+            hints.append(slip_pnr)
 
         if not text.strip() and "read_error" not in fields:
             fields["read_error"] = "no readable text (corrupt or scanned file)"
